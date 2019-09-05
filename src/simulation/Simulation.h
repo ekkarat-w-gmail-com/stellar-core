@@ -52,6 +52,9 @@ class Simulation
     std::vector<NodeID> getNodeIDs();
 
     void addPendingConnection(NodeID const& initiator, NodeID const& acceptor);
+    // Returns LoopbackPeerConnection given initiator, acceptor pair or nullptr
+    std::shared_ptr<LoopbackPeerConnection>
+    getLoopbackConnection(NodeID const& initiator, NodeID const& acceptor);
     void startAllNodes();
     void stopAllNodes();
     void removeNode(NodeID const& id);
@@ -64,13 +67,9 @@ class Simulation
     size_t crankAllNodes(int nbTicks = 1);
     void crankForAtMost(VirtualClock::duration seconds, bool finalCrank);
     void crankForAtLeast(VirtualClock::duration seconds, bool finalCrank);
-    void crankUntilSync(Application& app, VirtualClock::duration timeout,
-                        bool finalCrank);
     void crankUntil(std::function<bool()> const& fn,
                     VirtualClock::duration timeout, bool finalCrank);
     void crankUntil(VirtualClock::time_point timePoint, bool finalCrank);
-    std::vector<LoadGenerator::TestAccountPtr> accountsOutOfSyncWithDb(
-        Application& mainApp); // returns the accounts that don't match
     std::string metricsSummary(std::string domain = "");
 
     void addConnection(NodeID initiator, NodeID acceptor);

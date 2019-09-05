@@ -12,6 +12,7 @@
 #include "bucket/BucketManager.h"
 #include "bucket/BucketOutputIterator.h"
 #include "bucket/LedgerCmp.h"
+#include "bucket/MergeKey.h"
 #include "crypto/Hex.h"
 #include "crypto/Random.h"
 #include "crypto/SHA.h"
@@ -136,7 +137,8 @@ std::shared_ptr<Bucket>
 Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
               std::vector<LedgerEntry> const& initEntries,
               std::vector<LedgerEntry> const& liveEntries,
-              std::vector<LedgerKey> const& deadEntries, bool countMergeEvents)
+              std::vector<LedgerKey> const& deadEntries, bool countMergeEvents,
+              bool doFsync)
 {
     // When building fresh buckets after protocol version 10 (i.e. version
     // 11-or-after) we differentiate INITENTRY from LIVEENTRY. In older
@@ -150,7 +152,8 @@ Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
         convertToBucketEntry(useInit, initEntries, liveEntries, deadEntries);
 
     MergeCounters mc;
-    BucketOutputIterator out(bucketManager.getTmpDir(), true, meta, mc);
+    BucketOutputIterator out(bucketManager.getTmpDir(), true, meta, mc,
+                             doFsync);
     for (auto const& e : entries)
     {
         out.put(e);
@@ -392,7 +395,7 @@ calculateMergeProtocolVersion(
 // not scrutinizing the entry type further.
 static bool
 mergeCasesWithDefaultAcceptance(
-    BucketEntryIdCmp& cmp, MergeCounters& mc, BucketInputIterator& oi,
+    BucketEntryIdCmp const& cmp, MergeCounters& mc, BucketInputIterator& oi,
     BucketInputIterator& ni, BucketOutputIterator& out,
     std::vector<BucketInputIterator>& shadowIterators, uint32_t protocolVersion,
     bool keepShadowedLifecycleEntries)
@@ -565,7 +568,7 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
               std::shared_ptr<Bucket> const& oldBucket,
               std::shared_ptr<Bucket> const& newBucket,
               std::vector<std::shared_ptr<Bucket>> const& shadows,
-              bool keepDeadEntries, bool countMergeEvents)
+              bool keepDeadEntries, bool countMergeEvents, bool doFsync)
 {
     // This is the key operation in the scheme: merging two (read-only)
     // buckets together into a new 3rd bucket, while calculating its hash,
@@ -590,7 +593,7 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     BucketMetadata meta;
     meta.ledgerVersion = protocolVersion;
     BucketOutputIterator out(bucketManager.getTmpDir(), keepDeadEntries, meta,
-                             mc);
+                             mc, doFsync);
 
     BucketEntryIdCmp cmp;
     while (oi || ni)
@@ -608,6 +611,8 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     {
         bucketManager.incrMergeCounters(mc);
     }
-    return out.getBucket(bucketManager);
+    MergeKey mk{maxProtocolVersion, keepDeadEntries, oldBucket, newBucket,
+                shadows};
+    return out.getBucket(bucketManager, &mk);
 }
 }

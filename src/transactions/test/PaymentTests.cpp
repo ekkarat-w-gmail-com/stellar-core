@@ -41,7 +41,7 @@ TEST_CASE("payment", "[tx][payment]")
 
     // Do our setup in version 1 so that for_all_versions below does not
     // try to downgrade us from >1 to 1.
-    cfg.LEDGER_PROTOCOL_VERSION = 1;
+    cfg.USE_CONFIG_FOR_GENESIS = false;
 
     VirtualClock clock;
     auto app = createTestApplication(clock, cfg);
@@ -57,10 +57,6 @@ TEST_CASE("payment", "[tx][payment]")
     // minimum balance necessary to hold 2 trust lines
     const int64_t minBalance2 =
         app->getLedgerManager().getLastMinBalance(2) + 10 * txfee;
-
-    // minimum balance necessary to hold 2 trust lines and an offer
-    const int64_t minBalance3 =
-        app->getLedgerManager().getLastMinBalance(3) + 10 * txfee;
 
     const int64_t paymentAmount = minBalance2;
 

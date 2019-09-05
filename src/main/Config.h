@@ -28,15 +28,63 @@ struct HistoryArchiveConfiguration
 
 class Config : public std::enable_shared_from_this<Config>
 {
-    void validateConfig();
+    enum class ValidatorQuality : int
+    {
+        VALIDATOR_LOW_QUALITY = 0,
+        VALIDATOR_MED_QUALITY = 1,
+        VALIDATOR_HIGH_QUALITY = 2
+    };
+    struct ValidatorEntry
+    {
+        std::string mName;
+        std::string mHomeDomain;
+        ValidatorQuality mQuality;
+        PublicKey mKey;
+        bool mHasHistory;
+    };
+
+    void validateConfig(bool mixed);
     void loadQset(std::shared_ptr<cpptoml::table> group, SCPQuorumSet& qset,
                   int level);
+
+    void processConfig(std::shared_ptr<cpptoml::table>);
 
     void parseNodeID(std::string configStr, PublicKey& retKey);
     void parseNodeID(std::string configStr, PublicKey& retKey, SecretKey& sKey,
                      bool isSeed);
 
     std::string expandNodeID(std::string const& s) const;
+    void addValidatorName(std::string const& pubKeyStr,
+                          std::string const& name);
+    void addHistoryArchive(std::string const& name, std::string const& get,
+                           std::string const& put, std::string const& mkdir);
+
+    std::string toString(ValidatorQuality q) const;
+    ValidatorQuality parseQuality(std::string const& q) const;
+
+    std::vector<ValidatorEntry>
+    parseValidators(std::shared_ptr<cpptoml::base> validators,
+                    std::unordered_map<std::string, ValidatorQuality> const&
+                        domainQualityMap);
+
+    std::unordered_map<std::string, ValidatorQuality>
+    parseDomainsQuality(std::shared_ptr<cpptoml::base> domainsQuality);
+
+    static SCPQuorumSet
+    generateQuorumSetHelper(std::vector<ValidatorEntry>::const_iterator begin,
+                            std::vector<ValidatorEntry>::const_iterator end,
+                            ValidatorQuality curQuality);
+
+    static SCPQuorumSet
+    generateQuorumSet(std::vector<ValidatorEntry> const& validators);
+
+    void
+    addSelfToValidators(std::vector<ValidatorEntry>& validators,
+                        std::unordered_map<std::string, ValidatorQuality> const&
+                            domainQualityMap);
+
+    void verifyHistoryValidatorsBlocking(
+        std::vector<ValidatorEntry> const& validators);
 
   public:
     static const uint32 CURRENT_LEDGER_PROTOCOL_VERSION;
@@ -57,10 +105,9 @@ class Config : public std::enable_shared_from_this<Config>
     // application config
 
     // The default way stellar-core starts is to load the state from disk and
-    // catch
-    // up to the network before starting SCP.
-    // If you need different behavior you need to use --newdb or --force-scp
-    // which sets the following flags:
+    // catch up to the network before starting SCP. If you need different
+    // behavior you need to use new-db or force-scp which sets the following
+    // flags:
 
     // SCP will start running immediately using the current local state to
     // participate in consensus. DO NOT INCLUDE THIS IN A CONFIG FILE
@@ -119,6 +166,14 @@ class Config : public std::enable_shared_from_this<Config>
     // and should be false in all normal cases.
     bool ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING;
 
+    // A config parameter that forces replay to use the newest bucket logic;
+    // this implicitly means that replay will _not_ check bucket-list hashes
+    // along the way, but rather will use the stated hashes from ledger headers
+    // _in place of_ the real bucket list hash. This should only be enabled when
+    // testing since it completely defeats the state-integrity checking of the
+    // system.
+    bool ARTIFICIALLY_REPLAY_WITH_NEWEST_BUCKET_LOGIC_FOR_TESTING;
+
     // A config to allow connections to localhost
     // this should only be enabled when testing as it's a security issue
     bool ALLOW_LOCALHOST_FOR_TESTING;
@@ -142,6 +197,17 @@ class Config : public std::enable_shared_from_this<Config>
     // If set to true, bucket GC will not be performed. It can lead to massive
     // disk usage, but it is useful for recovering of nodes.
     bool DISABLE_BUCKET_GC;
+
+    // If set to true, writing an XDR file (a bucket or a checkpoint) will not
+    // be followed by an fsync on the file. This in turn means that XDR files
+    // (which hold the canonical state of the ledger) may be corrupted if the
+    // operating system suddenly crashes or loses power, causing the node to
+    // diverge and get stuck on restart, or potentially even publish bad
+    // history. This option only exists as an escape hatch if the local
+    // filesystem is so unusably slow that you prefer operating without
+    // durability guarantees. Do not set it to true unless you're very certain
+    // you want to make that trade.
+    bool DISABLE_XDR_FSYNC;
 
     // Set of cursors added at each startup with value '1'.
     std::vector<std::string> KNOWN_CURSORS;
@@ -209,6 +275,11 @@ class Config : public std::enable_shared_from_this<Config>
     SecretKey NODE_SEED;
     bool NODE_IS_VALIDATOR;
     stellar::SCPQuorumSet QUORUM_SET;
+    // this node's home domain
+    std::string NODE_HOME_DOMAIN;
+
+    // Whether to run online quorum intersection checks.
+    bool QUORUM_INTERSECTION_CHECKER;
 
     // Invariants
     std::vector<std::string> INVARIANT_CHECKS;
@@ -242,18 +313,25 @@ class Config : public std::enable_shared_from_this<Config>
     Config();
 
     void load(std::string const& filename);
+    void load(std::istream& in);
 
     // fixes values of connection-relates settings
     void adjust();
 
     std::string toShortString(PublicKey const& pk) const;
-    std::string toStrKey(PublicKey const& pk, bool& isAlias) const;
-    std::string toStrKey(PublicKey const& pk) const;
+
+    // fullKey true => returns full StrKey corresponding to pk
+    //  otherwise, returns alias or shortString equivalent
+    std::string toStrKey(PublicKey const& pk, bool fullKey) const;
+
     bool resolveNodeID(std::string const& s, PublicKey& retKey) const;
 
     std::chrono::seconds getExpectedLedgerCloseTime() const;
 
     void logBasicInfo();
     void setNoListen();
+
+    // function to stringify a quorum set
+    std::string toString(SCPQuorumSet const& qset);
 };
 }

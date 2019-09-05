@@ -64,8 +64,8 @@ class S3HistoryConfigurator : public HistoryConfigurator
 
 class TmpDirHistoryConfigurator : public HistoryConfigurator
 {
+    std::string mName;
     TmpDirManager mArchtmp;
-    TmpDir mDir;
 
   public:
     TmpDirHistoryConfigurator();
@@ -75,13 +75,25 @@ class TmpDirHistoryConfigurator : public HistoryConfigurator
     Config& configure(Config& cfg, bool writable) const override;
 };
 
-class ProtocolVersionTmpDirHistoryConfigurator
-    : public TmpDirHistoryConfigurator
+class MultiArchiveHistoryConfigurator : public HistoryConfigurator
 {
-    uint32_t mProtocolVersion;
+    std::vector<std::shared_ptr<TmpDirHistoryConfigurator>> mConfigurators;
 
   public:
-    ProtocolVersionTmpDirHistoryConfigurator(uint32_t protocolVersion);
+    explicit MultiArchiveHistoryConfigurator(uint32_t numArchives = 2);
+
+    Config& configure(Config& cfg, bool writable) const;
+
+    std::vector<std::shared_ptr<TmpDirHistoryConfigurator>>
+    getConfigurators() const
+    {
+        return mConfigurators;
+    }
+};
+
+class RealGenesisTmpDirHistoryConfigurator : public TmpDirHistoryConfigurator
+{
+  public:
     Config& configure(Config& cfg, bool writable) const override;
 };
 
@@ -226,7 +238,8 @@ class CatchupSimulation
     explicit CatchupSimulation(
         VirtualClock::Mode mode = VirtualClock::VIRTUAL_TIME,
         std::shared_ptr<HistoryConfigurator> cg =
-            std::make_shared<TmpDirHistoryConfigurator>());
+            std::make_shared<TmpDirHistoryConfigurator>(),
+        bool startApp = true);
     ~CatchupSimulation();
 
     Application&
@@ -255,7 +268,7 @@ class CatchupSimulation
 
     uint32_t getLastCheckpointLedger(uint32_t checkpointIndex) const;
 
-    void generateRandomLedger();
+    void generateRandomLedger(uint32_t version = 0);
 
     void ensurePublishesComplete();
     void ensureLedgerAvailable(uint32_t targetLedger);
@@ -263,9 +276,9 @@ class CatchupSimulation
     void ensureOnlineCatchupPossible(uint32_t targetLedger,
                                      uint32_t bufferLedgers = 0);
 
-    Application::pointer createCatchupApplication(
-        uint32_t count, Config::TestDbMode dbMode, std::string const& appName,
-        uint32_t protocol = Config::CURRENT_LEDGER_PROTOCOL_VERSION);
+    Application::pointer createCatchupApplication(uint32_t count,
+                                                  Config::TestDbMode dbMode,
+                                                  std::string const& appName);
     bool catchupOffline(Application::pointer app, uint32_t toLedger);
     bool catchupOnline(Application::pointer app, uint32_t initLedger,
                        uint32_t bufferLedgers = 0, uint32_t gapLedger = 0);

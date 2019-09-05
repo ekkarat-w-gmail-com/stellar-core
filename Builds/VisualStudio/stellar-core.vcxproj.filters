@@ -139,6 +139,18 @@
     <Filter Include="util\tests">
       <UniqueIdentifier>{856b0ad5-10a9-49a4-a36e-e98d7840bc83}</UniqueIdentifier>
     </Filter>
+    <Filter Include="github">
+      <UniqueIdentifier>{2f5780ba-6cc8-45ba-b70b-aa50af3af3ce}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="herder\simulation">
+      <UniqueIdentifier>{d3bc5d86-b218-4775-a47d-8db1a1ec26a0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="catchup\simulation">
+      <UniqueIdentifier>{03aee051-1ba2-40f7-9551-8dbeaf8c4232}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="transactions\simulation">
+      <UniqueIdentifier>{b342c551-848c-427d-8d3b-df060afe49aa}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\lib\util\getopt_long.c">
@@ -270,6 +282,9 @@
     <ClCompile Include="..\..\src\work\BasicWork.cpp">
       <Filter>work</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\work\ConditionalWork.cpp">
+      <Filter>work</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\work\Work.cpp">
       <Filter>work</Filter>
     </ClCompile>
@@ -278,9 +293,6 @@
     </ClCompile>
     <ClCompile Include="..\..\src\work\WorkSequence.cpp">
       <Filter>work</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\src\util\BitsetEnumerator.cpp">
-      <Filter>util</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\util\StatusManager.cpp">
       <Filter>util</Filter>
@@ -336,7 +348,7 @@
     <ClCompile Include="..\..\src\catchup\ApplyBucketsWork.cpp">
       <Filter>catchup</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\src\catchup\ApplyLedgerChainWork.cpp">
+    <ClCompile Include="..\..\src\catchup\ApplyCheckpointWork.cpp">
       <Filter>catchup</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\catchup\CatchupConfiguration.cpp">
@@ -346,6 +358,9 @@
       <Filter>catchup</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\catchup\CatchupWork.cpp">
+      <Filter>catchup</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\catchup\DownloadApplyTxsWork.cpp">
       <Filter>catchup</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\catchup\VerifyLedgerChainWork.cpp">
@@ -375,7 +390,7 @@
     <ClCompile Include="..\..\src\historywork\GunzipFileWork.cpp">
       <Filter>historyWork</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\src\historywork\GzipAndPutFilesWork.cpp">
+    <ClCompile Include="..\..\src\historywork\PutFilesWork.cpp">
       <Filter>historyWork</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\historywork\GzipFileWork.cpp">
@@ -397,9 +412,6 @@
       <Filter>historyWork</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\historywork\PutSnapshotFilesWork.cpp">
-      <Filter>historyWork</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\src\historywork\RepairMissingBucketsWork.cpp">
       <Filter>historyWork</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\historywork\ResolveSnapshotWork.cpp">
@@ -585,9 +597,6 @@
     <ClCompile Include="..\..\src\main\Config.cpp">
       <Filter>main</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\src\main\DeprecatedCommandLine.cpp">
-      <Filter>main</Filter>
-    </ClCompile>
     <ClCompile Include="..\..\src\main\dumpxdr.cpp">
       <Filter>main</Filter>
     </ClCompile>
@@ -634,9 +643,6 @@
       <Filter>history\tests</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\history\test\HistoryTestsUtils.cpp">
-      <Filter>history\tests</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\src\history\test\InferredQuorumTests.cpp">
       <Filter>history\tests</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\history\test\SerializeTests.cpp">
@@ -709,9 +715,6 @@
       <Filter>util\tests</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\util\test\BigDivideTests.cpp">
-      <Filter>util\tests</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\src\util\test\BitsetEnumeratorTests.cpp">
       <Filter>util\tests</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\util\test\DecoderTests.cpp">
@@ -894,6 +897,9 @@
     <ClCompile Include="..\..\src\overlay\OverlayManagerImpl.cpp">
       <Filter>overlay</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\overlay\OverlayMetrics.cpp">
+      <Filter>overlay</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\overlay\Peer.cpp">
       <Filter>overlay</Filter>
     </ClCompile>
@@ -932,6 +938,51 @@
     </ClCompile>
     <ClCompile Include="..\..\src\bucket\test\BucketManagerTests.cpp">
       <Filter>bucket\tests</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\util\BitSet.h">
+      <Filter>util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\lib\util\cbitset.c">
+      <Filter>util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\util\test\BitSetTests.cpp">
+      <Filter>util\tests</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\herder\test\QuorumIntersectionTests.cpp">
+      <Filter>herder\tests</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\herder\QuorumIntersectionCheckerImpl.cpp">
+      <Filter>herder</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\bucket\test\BucketMergeMapTests.cpp">
+      <Filter>bucket\tests</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\bucket\BucketMergeMap.cpp">
+      <Filter>bucket</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\bucket\MergeKey.cpp">
+      <Filter>bucket</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\herder\simulation\SimulationTxSetFrame.cpp">
+      <Filter>herder\simulation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\catchup\simulation\ApplyTransactionsWork.cpp">
+      <Filter>catchup\simulation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\catchup\simulation\HistoryArchiveStream.cpp">
+      <Filter>catchup\simulation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\transactions\simulation\SimulationMergeOpFrame.cpp">
+      <Filter>transactions\simulation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\transactions\simulation\SimulationTransactionFrame.cpp">
+      <Filter>transactions\simulation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\test\FuzzerImpl.cpp">
+      <Filter>test</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\util\FileSystemException.cpp">
+      <Filter>util</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -1091,6 +1142,9 @@
     <ClInclude Include="..\..\src\work\BasicWork.h">
       <Filter>work</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\src\work\ConditionalWork.h">
+      <Filter>work</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\src\work\Work.h">
       <Filter>work</Filter>
     </ClInclude>
@@ -1099,9 +1153,6 @@
     </ClInclude>
     <ClInclude Include="..\..\src\work\WorkSequence.h">
       <Filter>work</Filter>
-    </ClInclude>
-    <ClInclude Include="..\..\src\util\BitsetEnumerator.h">
-      <Filter>util</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\util\StatusManager.h">
       <Filter>util</Filter>
@@ -1172,7 +1223,7 @@
     <ClInclude Include="..\..\src\catchup\ApplyBucketsWork.h">
       <Filter>catchup</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\src\catchup\ApplyLedgerChainWork.h">
+    <ClInclude Include="..\..\src\catchup\ApplyCheckpointWork.h">
       <Filter>catchup</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\catchup\CatchupConfiguration.h">
@@ -1185,6 +1236,9 @@
       <Filter>catchup</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\catchup\CatchupWork.h">
+      <Filter>catchup</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\catchup\DownloadApplyTxsWork.h">
       <Filter>catchup</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\catchup\VerifyLedgerChainWork.h">
@@ -1217,7 +1271,7 @@
     <ClInclude Include="..\..\src\historywork\GzipFileWork.h">
       <Filter>historyWork</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\src\historywork\GzipAndPutFilesWork.h">
+    <ClInclude Include="..\..\src\historywork\PutFilesWork.h">
       <Filter>historyWork</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\historywork\MakeRemoteDirWork.h">
@@ -1236,9 +1290,6 @@
       <Filter>historyWork</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\historywork\PutSnapshotFilesWork.h">
-      <Filter>historyWork</Filter>
-    </ClInclude>
-    <ClInclude Include="..\..\src\historywork\RepairMissingBucketsWork.h">
       <Filter>historyWork</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\historywork\ResolveSnapshotWork.h">
@@ -1442,9 +1493,6 @@
     <ClInclude Include="..\..\src\main\Config.h">
       <Filter>main</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\src\main\DeprecatedCommandLine.h">
-      <Filter>main</Filter>
-    </ClInclude>
     <ClInclude Include="..\..\src\main\dumpxdr.h">
       <Filter>main</Filter>
     </ClInclude>
@@ -1577,6 +1625,9 @@
     <ClInclude Include="..\..\src\overlay\OverlayManagerImpl.h">
       <Filter>overlay</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\src\overlay\OverlayMetrics.h">
+      <Filter>overlay</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\src\overlay\Peer.h">
       <Filter>overlay</Filter>
     </ClInclude>
@@ -1609,6 +1660,45 @@
     </ClInclude>
     <ClInclude Include="..\..\src\herder\QuorumTracker.h">
       <Filter>herder</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\lib\util\cbitset.h">
+      <Filter>util</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\lib\util\cbitset_portability.h">
+      <Filter>util</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\herder\QuorumIntersectionChecker.h">
+      <Filter>herder</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\herder\QuorumIntersectionCheckerImpl.h">
+      <Filter>herder</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\bucket\BucketMergeMap.h">
+      <Filter>bucket</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\bucket\BucketTests.h">
+      <Filter>bucket</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\bucket\MergeKey.h">
+      <Filter>bucket</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\herder\simulation\SimulationTxSetFrame.h">
+      <Filter>herder\simulation</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\catchup\simulation\ApplyTransactionsWork.h">
+      <Filter>catchup\simulation</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\catchup\simulation\HistoryArchiveStream.h">
+      <Filter>catchup\simulation</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\transactions\simulation\SimulationMergeOpFrame.h">
+      <Filter>transactions\simulation</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\transactions\simulation\SimulationTransactionFrame.h">
+      <Filter>transactions\simulation</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\test\FuzzerImpl.h">
+      <Filter>test</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -1681,8 +1771,6 @@
     <None Include="..\..\CONTRIBUTING.md" />
     <None Include="..\..\README" />
     <None Include="..\..\travis-build.sh" />
-    <None Include="..\..\.github\ISSUE_TEMPLATE.md" />
-    <None Include="..\..\.github\PULL_REQUEST_TEMPLATE.md" />
     <None Include="..\..\src\history\serialize-tests\stellar-history.livenet.15686975.json">
       <Filter>history\tests\serialize-tests</Filter>
     </None>
@@ -1722,6 +1810,24 @@
     </None>
     <None Include="..\..\docs\stellar-core.1.md">
       <Filter>docs</Filter>
+    </None>
+    <None Include="..\..\docs\stellar-core_testnet_legacy.cfg">
+      <Filter>docs</Filter>
+    </None>
+    <None Include="..\..\docs\stellar-core_example_validators.cfg">
+      <Filter>docs</Filter>
+    </None>
+    <None Include="..\..\.github\ISSUE_TEMPLATE\bug-report.md">
+      <Filter>github</Filter>
+    </None>
+    <None Include="..\..\.github\ISSUE_TEMPLATE\documentation.md">
+      <Filter>github</Filter>
+    </None>
+    <None Include="..\..\.github\ISSUE_TEMPLATE\feature-request.md">
+      <Filter>github</Filter>
+    </None>
+    <None Include="..\..\.github\PULL_REQUEST_TEMPLATE.md">
+      <Filter>github</Filter>
     </None>
   </ItemGroup>
   <ItemGroup>

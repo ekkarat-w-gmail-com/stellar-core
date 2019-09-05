@@ -94,6 +94,7 @@ class Work : public BasicWork
     void onReset() final;
     void onFailureRaise() override;
     void onFailureRetry() override;
+    BasicWork::State checkChildrenStatus() const;
 
     // Work::onRun() above implements logic that propagates onRun() calls
     // to the next runnable child in round-robin order; when no children
@@ -111,8 +112,8 @@ class Work : public BasicWork
     std::list<std::shared_ptr<BasicWork>> mChildren;
     std::list<std::shared_ptr<BasicWork>>::const_iterator mNextChild;
 
-    uint32_t mDoneChildren{0};
-    uint32_t mTotalChildren{0};
+    size_t mDoneChildren{0};
+    size_t mTotalChildren{0};
 
     std::shared_ptr<BasicWork> yieldNextRunningChild();
     void addChild(std::shared_ptr<BasicWork> child);
@@ -124,6 +125,11 @@ class Work : public BasicWork
 
 namespace WorkUtils
 {
-BasicWork::State checkChildrenStatus(Work const& w);
+BasicWork::State
+getWorkStatus(std::list<std::shared_ptr<BasicWork>> const& works);
+
+bool allSuccessful(std::list<std::shared_ptr<BasicWork>> const& works);
+bool anyFailed(std::list<std::shared_ptr<BasicWork>> const& works);
+bool anyRunning(std::list<std::shared_ptr<BasicWork>> const& works);
 }
 }

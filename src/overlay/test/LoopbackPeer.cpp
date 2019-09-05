@@ -8,6 +8,7 @@
 #include "medida/timer.h"
 #include "overlay/LoadManager.h"
 #include "overlay/OverlayManager.h"
+#include "overlay/OverlayMetrics.h"
 #include "overlay/StellarXDR.h"
 #include "util/Logging.h"
 #include "util/Math.h"
@@ -112,7 +113,6 @@ LoopbackPeer::drop(std::string const& reason, DropDirection direction, DropMode)
                                  ? Peer::DropDirection::REMOTE_DROPPED_US
                                  : Peer::DropDirection::WE_DROPPED_REMOTE,
                              Peer::DropMode::IGNORE_WRITE_QUEUE);
-
             },
             "LoopbackPeer: drop");
     }
@@ -238,8 +238,8 @@ LoopbackPeer::deliverOne()
         {
             mLastEmpty = mApp.getClock().now();
         }
-        mMessageWrite.Mark();
-        mByteWrite.Mark(nBytes);
+        getOverlayMetrics().mMessageWrite.Mark();
+        getOverlayMetrics().mByteWrite.Mark(nBytes);
 
         // CLOG(TRACE, "Overlay") << "LoopbackPeer posted message to remote";
     }
@@ -293,6 +293,13 @@ void
 LoopbackPeer::setCorked(bool c)
 {
     mCorked = c;
+}
+
+void
+LoopbackPeer::clearInAndOutQueues()
+{
+    mOutQueue.clear();
+    mInQueue = std::queue<xdr::msg_ptr>();
 }
 
 bool

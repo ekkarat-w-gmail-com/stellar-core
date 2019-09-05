@@ -128,7 +128,6 @@ ApplicationImpl::initialize(bool createNewDB)
     mHistoryManager = HistoryManager::create(*this);
     mInvariantManager = createInvariantManager();
     mMaintainer = std::make_unique<Maintainer>(*this);
-    mProcessManager = ProcessManager::create(*this);
     mCommandHandler = std::make_unique<CommandHandler>(*this);
     mWorkScheduler = WorkScheduler::create(*this);
     mBanManager = BanManager::create(*this);
@@ -153,6 +152,10 @@ ApplicationImpl::initialize(bool createNewDB)
         upgradeDB();
     }
 
+    // Subtle: process manager should come to existence _after_ BucketManager
+    // initialization and newDB run, as it relies on tmp dir created in the
+    // constructor
+    mProcessManager = ProcessManager::create(*this);
     LOG(DEBUG) << "Application constructed";
 }
 
@@ -161,6 +164,7 @@ ApplicationImpl::newDB()
 {
     mDatabase->initialize();
     mDatabase->upgradeToCurrentSchema();
+    mBucketManager->dropAll();
     mLedgerManager->startNewLedger();
 }
 
@@ -267,13 +271,9 @@ ApplicationImpl::getJsonInfo()
     }
 
     auto& herder = getHerder();
-    auto q =
+    info["quorum"] =
         herder.getJsonQuorumInfo(getConfig().NODE_SEED.getPublicKey(), true,
                                  false, herder.getCurrentLedgerSeq());
-    if (q["slots"].size() != 0)
-    {
-        info["quorum"] = q["slots"];
-    }
 
     auto invariantFailures = getInvariantManager().getJsonInfo();
     if (!invariantFailures.empty())
@@ -351,21 +351,6 @@ ApplicationImpl::start()
     if (mConfig.QUORUM_SET.threshold == 0)
     {
         throw std::invalid_argument("Quorum not configured");
-    }
-    if (!isQuorumSetSane(mConfig.QUORUM_SET, !mConfig.UNSAFE_QUORUM))
-    {
-        std::string err("Invalid QUORUM_SET: duplicate entry or bad threshold "
-                        "(should be between ");
-        if (mConfig.UNSAFE_QUORUM)
-        {
-            err = err + "1";
-        }
-        else
-        {
-            err = err + "51";
-        }
-        err = err + " and 100)";
-        throw std::invalid_argument(err);
     }
 
     mConfig.logBasicInfo();

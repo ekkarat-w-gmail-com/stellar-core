@@ -61,7 +61,7 @@ After installing packages, head to [building with clang and libc++](#building-wi
 
 #### Installing packages
     # common packages
-    sudo apt-get install git build-essential pkg-config autoconf automake libtool bison flex libpq-dev
+    sudo apt-get install git build-essential pkg-config autoconf automake libtool bison flex libpq-dev parallel
     # if using clang
     sudo apt-get install clang-5.0
     # clang with libstdc++
@@ -89,6 +89,7 @@ When building on OSX, here's some dependencies you'll need:
 - brew install pkg-config
 - brew install libpqxx *(If ./configure later complains about libpq missing, try PKG_CONFIG_PATH='/usr/local/lib/pkgconfig')*
 - brew install pandoc
+- brew install parallel (required for running tests)
 
 ### Windows
 See [INSTALL-Windows.md](INSTALL-Windows.md)
@@ -101,7 +102,7 @@ See [INSTALL-Windows.md](INSTALL-Windows.md)
 - `git submodule update`
 - Type `./autogen.sh`.
 - Type `./configure`   *(If configure complains about compiler versions, try `CXX=clang-5.0 ./configure` or `CXX=g++-6 ./configure` or similar, depending on your compiler.)*
-- Type `make` or `make -j` (for aggressive parallel build)
+- Type `make` or `make -j<N>` (where `<N>` is the number of parallel builds, a number less than the number of CPU cores available, e.g. `make -j3`)
 - Type `make check` to run tests.
 - Type `make install` to install.
 

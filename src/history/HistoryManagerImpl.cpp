@@ -19,7 +19,6 @@
 #include "historywork/FetchRecentQsetsWork.h"
 #include "historywork/PublishWork.h"
 #include "historywork/PutSnapshotFilesWork.h"
-#include "historywork/RepairMissingBucketsWork.h"
 #include "historywork/ResolveSnapshotWork.h"
 #include "historywork/WriteSnapshotWork.h"
 #include "ledger/LedgerManager.h"
@@ -73,6 +72,8 @@ HistoryManagerImpl::HistoryManagerImpl(Application& app)
           app.getMetrics().NewMeter({"history", "publish", "success"}, "event"))
     , mPublishFailure(
           app.getMetrics().NewMeter({"history", "publish", "failure"}, "event"))
+    , mEnqueueToPublishTimer(
+          app.getMetrics().NewTimer({"history", "publish", "time"}))
 {
 }
 
@@ -183,11 +184,11 @@ HistoryManagerImpl::getLastClosedHistoryArchiveState() const
 }
 
 InferredQuorum
-HistoryManagerImpl::inferQuorum()
+HistoryManagerImpl::inferQuorum(uint32_t ledgerNum)
 {
     InferredQuorum iq;
     CLOG(INFO, "History") << "Starting FetchRecentQsetsWork";
-    mApp.getWorkScheduler().executeWork<FetchRecentQsetsWork>(iq);
+    mApp.getWorkScheduler().executeWork<FetchRecentQsetsWork>(iq, ledgerNum);
     return iq;
 }
 
@@ -254,6 +255,8 @@ HistoryManagerImpl::queueCurrentHistory()
 
     auto ledger = has.currentLedger;
     CLOG(DEBUG, "History") << "Queueing publish state for ledger " << ledger;
+    mEnqueueTimes.emplace(ledger, std::chrono::steady_clock::now());
+
     auto state = has.toString();
     auto timer = mApp.getDatabase().getInsertTimer("publishqueue");
     auto prep = mApp.getDatabase().getPreparedStatement(
@@ -302,6 +305,15 @@ HistoryManagerImpl::takeSnapshotAndPublish(HistoryArchiveState const& has)
 size_t
 HistoryManagerImpl::publishQueuedHistory()
 {
+#ifdef BUILD_TESTS
+    if (!mPublicationEnabled)
+    {
+        CLOG(INFO, "History")
+            << "Publication explicitly disabled, so not publishing";
+        return 0;
+    }
+#endif
+
     std::string state;
 
     auto prep = mApp.getDatabase().getPreparedStatement(
@@ -396,6 +408,18 @@ HistoryManagerImpl::historyPublished(
 {
     if (success)
     {
+        auto iter = mEnqueueTimes.find(ledgerSeq);
+        if (iter != mEnqueueTimes.end())
+        {
+            auto now = std::chrono::steady_clock::now();
+            CLOG(DEBUG, "Perf")
+                << "Published history for ledger " << ledgerSeq << " in "
+                << std::chrono::duration<double>(now - iter->second).count()
+                << " seconds";
+            mEnqueueToPublishTimer.Update(now - iter->second);
+            mEnqueueTimes.erase(iter);
+        }
+
         this->mPublishSuccess.Mark();
         auto timer = mApp.getDatabase().getDeleteTimer("publishqueue");
         auto prep = mApp.getDatabase().getPreparedStatement(
@@ -416,16 +440,6 @@ HistoryManagerImpl::historyPublished(
                           "HistoryManagerImpl: publishQueuedHistory");
 }
 
-void
-HistoryManagerImpl::downloadMissingBuckets(
-    HistoryArchiveState desiredState,
-    std::function<void(asio::error_code const& ec)> handler)
-{
-    CLOG(INFO, "History") << "Starting RepairMissingBucketsWork";
-    mApp.getWorkScheduler().scheduleWork<RepairMissingBucketsWork>(desiredState,
-                                                                   handler);
-}
-
 uint64_t
 HistoryManagerImpl::getPublishQueueCount()
 {
@@ -443,4 +457,14 @@ HistoryManagerImpl::getPublishFailureCount()
 {
     return mPublishFailure.count();
 }
+
+#ifdef BUILD_TESTS
+void
+HistoryManagerImpl::setPublicationEnabled(bool enabled)
+{
+    CLOG(INFO, "History") << (enabled ? "Enabling" : "Disabling")
+                          << " history publication";
+    mPublicationEnabled = enabled;
+}
+#endif
 }

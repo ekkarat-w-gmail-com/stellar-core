@@ -518,6 +518,10 @@ class LedgerTxnRoot::Impl
     void dropOffers();
     void dropTrustLines();
 
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    void resetForFuzzer();
+#endif // FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+
     // getAllOffers has the basic exception safety guarantee. If it throws an
     // exception, then
     // - the prepared statement cache may be, but is not guaranteed to be,
@@ -563,30 +567,6 @@ class LedgerTxnRoot::Impl
 
     // rollbackChild has the strong exception safety guarantee.
     void rollbackChild();
-
-    // writeSignersTableIntoAccountsTable has the basic exception safety
-    // guarantee. If it throws an exception, then
-    // - the prepared statement cache may be, but is not guaranteed to be,
-    //   modified
-    void writeSignersTableIntoAccountsTable();
-
-    // encodedDataNamesBase64 has the basic exception safety guarantee. If it
-    // throws an exception, then
-    // - the prepared statement cache may be, but is not guaranteed to be,
-    //   modified
-    void encodeDataNamesBase64();
-
-    // encodedHomeDomainsBase64 has the basic exception safety guarantee. If it
-    // throws an exception, then
-    // - the prepared statement cache may be, but is not guaranteed to be,
-    //   modified
-    void encodeHomeDomainsBase64();
-
-    // writeOffersIntoSimplifiedOffersTable has the basic exception safety
-    // guarantee. If it throws an exception, then
-    // - the prepared statement cache may be, but is not guaranteed to be,
-    //   modified
-    void writeOffersIntoSimplifiedOffersTable();
 
     // Prefetch some or all of given keys in batches. Note that no prefetching
     // could occur if the cache is at its fill ratio. Returns number of keys

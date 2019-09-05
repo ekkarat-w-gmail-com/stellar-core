@@ -63,8 +63,7 @@ StateSnapshot::makeLive()
             // here, we're going to live with the approximate value for now.
             uint32_t maxProtocolVersion =
                 Config::CURRENT_LEDGER_PROTOCOL_VERSION;
-            hb.next.makeLive(mApp, maxProtocolVersion,
-                             BucketList::keepDeadEntries(i));
+            hb.next.makeLive(mApp, maxProtocolVersion, i);
         }
     }
 }
@@ -88,7 +87,9 @@ StateSnapshot::writeHistoryBlocks() const
     uint32_t begin, count;
     size_t nHeaders;
     {
-        XDROutputFileStream ledgerOut, txOut, txResultOut, scpHistory;
+        bool doFsync = !mApp.getConfig().DISABLE_XDR_FSYNC;
+        XDROutputFileStream ledgerOut(doFsync), txOut(doFsync),
+            txResultOut(doFsync), scpHistory(doFsync);
         ledgerOut.open(mLedgerSnapFile->localPath_nogz());
         txOut.open(mTransactionSnapFile->localPath_nogz());
         txResultOut.open(mTransactionResultSnapFile->localPath_nogz());
@@ -152,5 +153,31 @@ StateSnapshot::writeHistoryBlocks() const
     }
 
     return true;
+}
+
+std::vector<std::shared_ptr<FileTransferInfo>>
+StateSnapshot::differingHASFiles(HistoryArchiveState const& other)
+{
+    std::vector<std::shared_ptr<FileTransferInfo>> files{};
+    auto addIfExists = [&](std::shared_ptr<FileTransferInfo> const& f) {
+        if (f && fs::exists(f->localPath_nogz()))
+        {
+            files.push_back(f);
+        }
+    };
+
+    addIfExists(mLedgerSnapFile);
+    addIfExists(mTransactionSnapFile);
+    addIfExists(mTransactionResultSnapFile);
+    addIfExists(mSCPHistorySnapFile);
+
+    for (auto const& hash : mLocalState.differingBuckets(other))
+    {
+        auto b = mApp.getBucketManager().getBucketByHash(hexToBin256(hash));
+        assert(b);
+        addIfExists(std::make_shared<FileTransferInfo>(*b));
+    }
+
+    return files;
 }
 }

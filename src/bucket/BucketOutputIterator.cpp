@@ -35,8 +35,9 @@ randomBucketName(std::string const& tmpDir)
 BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
                                            bool keepDeadEntries,
                                            BucketMetadata const& meta,
-                                           MergeCounters& mc)
+                                           MergeCounters& mc, bool doFsync)
     : mFilename(randomBucketName(tmpDir))
+    , mOut(doFsync)
     , mBuf(nullptr)
     , mHasher(SHA256::create())
     , mKeepDeadEntries(keepDeadEntries)
@@ -105,7 +106,8 @@ BucketOutputIterator::put(BucketEntry const& e)
 }
 
 std::shared_ptr<Bucket>
-BucketOutputIterator::getBucket(BucketManager& bucketManager)
+BucketOutputIterator::getBucket(BucketManager& bucketManager,
+                                MergeKey* mergeKey)
 {
     if (mBuf)
     {
@@ -124,6 +126,6 @@ BucketOutputIterator::getBucket(BucketManager& bucketManager)
         return std::make_shared<Bucket>();
     }
     return bucketManager.adoptFileAsBucket(mFilename, mHasher->finish(),
-                                           mObjectsPut, mBytesPut);
+                                           mObjectsPut, mBytesPut, mergeKey);
 }
 }

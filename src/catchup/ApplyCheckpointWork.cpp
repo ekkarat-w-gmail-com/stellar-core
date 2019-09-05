@@ -2,7 +2,8 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "catchup/ApplyLedgerChainWork.h"
+#include "catchup/ApplyCheckpointWork.h"
+#include "bucket/BucketManager.h"
 #include "herder/LedgerCloseData.h"
 #include "history/FileTransferInfo.h"
 #include "history/HistoryManager.h"
@@ -22,57 +23,65 @@
 namespace stellar
 {
 
-ApplyLedgerChainWork::ApplyLedgerChainWork(
-    Application& app, TmpDir const& downloadDir, LedgerRange range,
-    LedgerHeaderHistoryEntry& lastApplied)
-    : BasicWork(app, "apply-ledger-chain", RETRY_NEVER)
+ApplyCheckpointWork::ApplyCheckpointWork(Application& app,
+                                         TmpDir const& downloadDir,
+                                         LedgerRange const& range)
+    : BasicWork(app,
+                "apply-ledgers-" +
+                    fmt::format("{}-{}", range.mFirst, range.mLast),
+                BasicWork::RETRY_NEVER)
     , mDownloadDir(downloadDir)
-    , mRange(range)
-    , mLastApplied(lastApplied)
+    , mCheckpointRange(range)
+    , mCheckpoint(
+          app.getHistoryManager().checkpointContainingLedger(range.mFirst))
     , mApplyLedgerSuccess(app.getMetrics().NewMeter(
           {"history", "apply-ledger-chain", "success"}, "event"))
     , mApplyLedgerFailure(app.getMetrics().NewMeter(
           {"history", "apply-ledger-chain", "failure"}, "event"))
 {
+    // Ledger range check to enforce application of a single checkpoint
+    auto const& hm = mApp.getHistoryManager();
+    auto low = std::max(LedgerManager::GENESIS_LEDGER_SEQ,
+                        hm.prevCheckpointLedger(mCheckpoint));
+    if (mCheckpointRange.mFirst != low)
+    {
+        throw std::runtime_error(
+            "Ledger range start must be aligned with checkpoint start");
+    }
+    if (mCheckpointRange.mLast > mCheckpoint)
+    {
+        throw std::runtime_error(
+            "Ledger range must span at most 1 checkpoint worth of ledgers");
+    }
 }
 
 std::string
-ApplyLedgerChainWork::getStatus() const
+ApplyCheckpointWork::getStatus() const
 {
     if (getState() == State::WORK_RUNNING)
     {
-        std::string task = "applying checkpoint";
-        return fmtProgress(mApp, task, mRange.first(), mRange.last(), mCurrSeq);
+        auto lcl = mApp.getLedgerManager().getLastClosedLedgerNum();
+        return fmt::format("Last applied ledger: {}", lcl);
     }
     return BasicWork::getStatus();
 }
 
 void
-ApplyLedgerChainWork::onReset()
+ApplyCheckpointWork::onReset()
 {
-    mLastApplied = mApp.getLedgerManager().getLastClosedLedgerHeader();
-    auto& lm = mApp.getLedgerManager();
-    auto& hm = mApp.getHistoryManager();
-
-    CLOG(INFO, "History") << "Replaying contents of "
-                          << CheckpointRange{mRange, hm}.count()
-                          << " transaction-history files from LCL "
-                          << LedgerManager::ledgerAbbrev(
-                                 lm.getLastClosedLedgerHeader());
-    mCurrSeq =
-        mApp.getHistoryManager().checkpointContainingLedger(mRange.first());
     mHdrIn.close();
     mTxIn.close();
     mFilesOpen = false;
 }
 
 void
-ApplyLedgerChainWork::openCurrentInputFiles()
+ApplyCheckpointWork::openInputFiles()
 {
     mHdrIn.close();
     mTxIn.close();
-    FileTransferInfo hi(mDownloadDir, HISTORY_FILE_TYPE_LEDGER, mCurrSeq);
-    FileTransferInfo ti(mDownloadDir, HISTORY_FILE_TYPE_TRANSACTIONS, mCurrSeq);
+    FileTransferInfo hi(mDownloadDir, HISTORY_FILE_TYPE_LEDGER, mCheckpoint);
+    FileTransferInfo ti(mDownloadDir, HISTORY_FILE_TYPE_TRANSACTIONS,
+                        mCheckpoint);
     CLOG(DEBUG, "History") << "Replaying ledger headers from "
                            << hi.localPath_nogz();
     CLOG(DEBUG, "History") << "Replaying transactions from "
@@ -84,7 +93,7 @@ ApplyLedgerChainWork::openCurrentInputFiles()
 }
 
 TxSetFramePtr
-ApplyLedgerChainWork::getCurrentTxSet()
+ApplyCheckpointWork::getCurrentTxSet()
 {
     auto& lm = mApp.getLedgerManager();
     auto seq = lm.getLastClosedLedgerNum() + 1;
@@ -118,7 +127,7 @@ ApplyLedgerChainWork::getCurrentTxSet()
 }
 
 bool
-ApplyLedgerChainWork::applyHistoryOfSingleLedger()
+ApplyCheckpointWork::applyHistoryOfSingleLedger()
 {
     LedgerHeaderHistoryEntry hHeader;
     LedgerHeader& header = hHeader.header;
@@ -212,6 +221,20 @@ ApplyLedgerChainWork::applyHistoryOfSingleLedger()
             hexAbbrev(header.scpValue.txSetHash)));
     }
 
+#ifdef BUILD_TESTS
+    if (mApp.getConfig()
+            .ARTIFICIALLY_REPLAY_WITH_NEWEST_BUCKET_LOGIC_FOR_TESTING)
+    {
+        auto& bm = mApp.getBucketManager();
+        CLOG(INFO, "History")
+            << "Forcing bucket manager to use version "
+            << Config::CURRENT_LEDGER_PROTOCOL_VERSION << " with hash "
+            << hexAbbrev(header.bucketListHash);
+        bm.setNextCloseVersionAndHashForTesting(
+            Config::CURRENT_LEDGER_PROTOCOL_VERSION, header.bucketListHash);
+    }
+#endif
+
     LedgerCloseData closeData(header.ledgerSeq, txset, header.scpValue);
     lm.closeLedger(closeData);
 
@@ -229,35 +252,29 @@ ApplyLedgerChainWork::applyHistoryOfSingleLedger()
     }
 
     mApplyLedgerSuccess.Mark();
-    mLastApplied = hHeader;
     return true;
 }
 
 BasicWork::State
-ApplyLedgerChainWork::onRun()
+ApplyCheckpointWork::onRun()
 {
     try
     {
         if (!mFilesOpen)
         {
-            openCurrentInputFiles();
+            openInputFiles();
         }
 
-        if (!applyHistoryOfSingleLedger())
-        {
-            mCurrSeq += mApp.getHistoryManager().getCheckpointFrequency();
-            mFilesOpen = false;
-        }
+        auto result = applyHistoryOfSingleLedger();
+        auto const& lm = mApp.getLedgerManager();
+        auto done = lm.getLastClosedLedgerNum() == mCheckpointRange.mLast;
 
-        mApp.getCatchupManager().logAndUpdateCatchupStatus(true);
-
-        auto& lm = mApp.getLedgerManager();
-        auto const& lclHeader = lm.getLastClosedLedgerHeader();
-        if (lclHeader.header.ledgerSeq == mRange.last())
+        if (done)
         {
             return State::WORK_SUCCESS;
         }
-        return State::WORK_RUNNING;
+
+        return result ? State::WORK_RUNNING : State::WORK_FAILURE;
     }
     catch (InvariantDoesNotHold&)
     {
@@ -265,7 +282,7 @@ ApplyLedgerChainWork::onRun()
         CLOG(ERROR, "History") << "Replay failed";
         throw;
     }
-    catch (FileSystemException& e)
+    catch (FileSystemException&)
     {
         CLOG(ERROR, "History") << POSSIBLY_CORRUPTED_LOCAL_FS;
         return State::WORK_FAILURE;

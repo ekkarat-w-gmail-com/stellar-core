@@ -39,15 +39,24 @@ fi
 
 # Try to ensure we're using the real g++ and clang++ versions we want
 mkdir bin
+which gcc-6
 ln -s `which gcc-6` bin/gcc
+which g++-6
 ln -s `which g++-6` bin/g++
+which clang-5.0
 ln -s `which clang-5.0` bin/clang
+which clang++-5.0
 ln -s `which clang++-5.0` bin/clang++
+which llvm-symbolizer-5.0
 ln -s `which llvm-symbolizer-5.0` bin/llvm-symbolizer
 
 export PATH=`pwd`/bin:$PATH
+echo "PATH is $PATH"
+
 hash -r
+
 clang -v
+which g++
 g++ -v
 llvm-symbolizer --version || true
 
@@ -68,6 +77,14 @@ export LSAN_OPTIONS=detect_leaks=0
 
 echo "config_flags = $config_flags"
 
+#### ccache config
+export CCACHE_COMPRESS=true
+export CCACHE_COMPILERCHECK="string:$CXX"
+export CCACHE_MAXSIZE=900M
+export CCACHE_CPP2=true
+
+ccache -p
+
 ccache -s
 date
 time ./autogen.sh
@@ -83,6 +100,7 @@ fi
 
 date
 time make -j$(($NPROCS + 1))
+
 ccache -s
 
 if [ $WITH_TESTS -eq 0 ] ; then
@@ -105,6 +123,7 @@ export ALL_VERSIONS=1
 export TEMP_POSTGRES=0
 export NUM_PARTITIONS=$((NPROCS*2))
 export RUN_PARTITIONS
+ulimit -n 256
 time make check
 
 echo All done

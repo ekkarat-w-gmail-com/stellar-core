@@ -51,6 +51,9 @@ class LedgerManagerImpl : public LedgerManager
     medida::Counter& mPrefetchHitRate;
     VirtualClock::time_point mLastClose;
 
+    std::unique_ptr<VirtualClock::time_point> mStartCatchup;
+    medida::Timer& mCatchupDuration;
+
     medida::Counter& mSyncingLedgersSize;
     uint32_t mCatchupTriggerLedger{0};
 
@@ -59,8 +62,7 @@ class LedgerManagerImpl : public LedgerManager
     void addToSyncingLedgers(LedgerCloseData const& ledgerData);
     void startCatchupIf(uint32_t lastReceivedLedgerSeq);
 
-    void historyCaughtup(asio::error_code const& ec,
-                         CatchupWork::ProgressState progressState,
+    void historyCaughtup(CatchupWork::ProgressState progressState,
                          LedgerHeaderHistoryEntry const& lastClosed,
                          CatchupConfiguration::Mode catchupMode);
 
@@ -124,7 +126,7 @@ class LedgerManagerImpl : public LedgerManager
     uint64_t secondsSinceLastLedgerClose() const override;
     void syncMetrics() override;
 
-    void startNewLedger(LedgerHeader genesisLedger);
+    void startNewLedger(LedgerHeader const& genesisLedger);
     void startNewLedger() override;
     void loadLastKnownLedger(
         std::function<void(asio::error_code const& ec)> handler) override;

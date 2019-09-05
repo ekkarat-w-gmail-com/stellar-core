@@ -9,6 +9,7 @@
 #include "herder/HerderPersistence.h"
 #include "herder/HerderUtils.h"
 #include "herder/LedgerCloseData.h"
+#include "herder/QuorumIntersectionChecker.h"
 #include "herder/TxSetFrame.h"
 #include "ledger/LedgerManager.h"
 #include "ledger/LedgerTxn.h"
@@ -136,22 +137,6 @@ HerderImpl::valueExternalized(uint64 slotIndex, StellarValue const& value)
     // record metrics
     getHerderSCPDriver().recordSCPExecutionMetrics(slotIndex);
 
-    // dump SCP information if this ledger took a long time
-    auto now = mApp.getClock().now();
-    auto gap =
-        std::chrono::duration_cast<std::chrono::seconds>(now - mLastExternalize)
-            .count();
-    if (gap > DUMP_SCP_TIMEOUT_SECONDS)
-    {
-        auto slotInfo = getJsonQuorumInfo(getSCP().getLocalNodeID(), false,
-                                          false, slotIndex);
-        Json::FastWriter fw;
-        CLOG(WARNING, "Herder")
-            << fmt::format("Ledger took {} seconds, SCP information:{}", gap,
-                           fw.write(slotInfo));
-    }
-    mLastExternalize = now;
-
     // called both here and at the end (this one is in case of an exception)
     trackingHeartBeat();
 
@@ -194,12 +179,29 @@ HerderImpl::valueExternalized(uint64 slotIndex, StellarValue const& value)
         }
     }
 
+    // dump SCP information if this ledger took a long time
+    auto gap =
+        std::chrono::duration<double>(mApp.getClock().now() - mLastExternalize)
+            .count();
+    if (gap > DUMP_SCP_TIMEOUT_SECONDS)
+    {
+        auto slotInfo = getJsonQuorumInfo(getSCP().getLocalNodeID(), false,
+                                          false, slotIndex);
+        Json::FastWriter fw;
+        CLOG(WARNING, "Herder")
+            << fmt::format("Ledger took {} seconds, SCP information:{}", gap,
+                           fw.write(slotInfo));
+    }
+
     // tell the LedgerManager that this value got externalized
     // LedgerManager will perform the proper action based on its internal
     // state: apply, trigger catchup, etc
     LedgerCloseData ledgerData(mHerderSCPDriver.lastConsensusLedgerIndex(),
                                externalizedSet, value);
     mLedgerManager.valueExternalized(ledgerData);
+
+    // start timing next externalize from this point
+    mLastExternalize = mApp.getClock().now();
 
     // perform cleanups
     updateTransactionQueue(externalizedSet->mTransactions);
@@ -211,6 +213,9 @@ HerderImpl::valueExternalized(uint64 slotIndex, StellarValue const& value)
     }
 
     ledgerClosed();
+
+    // Check to see if quorums have changed and we need to reanalyze.
+    checkAndMaybeReanalyzeQuorumMap();
 
     // heart beat *after* doing all the work (ensures that we do not include
     // the overhead of externalization in the way we track SCP)
@@ -347,7 +352,7 @@ HerderImpl::checkCloseTime(SCPEnvelope const& envelope, bool enforceRecent)
                 // value
                 r = (lastCloseIndex == envLedgerIndex &&
                      lastCloseTime == sv.closeTime);
-                // for older messages, just ensure that they occured before
+                // for older messages, just ensure that they occurred before
                 r = r || (lastCloseIndex > envLedgerIndex &&
                           lastCloseTime > sv.closeTime);
                 // for future message, perform the same validity check than
@@ -727,7 +732,7 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger)
     auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
     auto proposedSet = mTransactionQueue.toTxSet(lcl.hash);
     auto removed = proposedSet->trimInvalid(mApp);
-    mTransactionQueue.remove(removed);
+    mTransactionQueue.ban(removed);
 
     proposedSet->surgePricingFilter(mApp);
 
@@ -874,11 +879,60 @@ Json::Value
 HerderImpl::getJsonInfo(size_t limit, bool fullKeys)
 {
     Json::Value ret;
-    ret["you"] =
-        mApp.getConfig().toStrKey(mApp.getConfig().NODE_SEED.getPublicKey());
+    ret["you"] = mApp.getConfig().toStrKey(
+        mApp.getConfig().NODE_SEED.getPublicKey(), fullKeys);
 
     ret["scp"] = getSCP().getJsonInfo(limit, fullKeys);
     ret["queue"] = mPendingEnvelopes.getJsonInfo(limit);
+    return ret;
+}
+
+Json::Value
+HerderImpl::getJsonTransitiveQuorumIntersectionInfo(bool fullKeys) const
+{
+    Json::Value ret;
+    ret["intersection"] =
+        mLastQuorumMapIntersectionState.enjoysQuorunIntersection();
+    ret["node_count"] =
+        static_cast<Json::UInt64>(mLastQuorumMapIntersectionState.mNumNodes);
+    ret["last_check_ledger"] = static_cast<Json::UInt64>(
+        mLastQuorumMapIntersectionState.mLastCheckLedger);
+    if (mLastQuorumMapIntersectionState.enjoysQuorunIntersection())
+    {
+        Json::Value critical;
+        for (auto const& group :
+             mLastQuorumMapIntersectionState.mIntersectionCriticalNodes)
+        {
+            Json::Value jg;
+            for (auto const& k : group)
+            {
+                auto s = mApp.getConfig().toStrKey(k, fullKeys);
+                jg.append(s);
+            }
+            critical.append(jg);
+        }
+        ret["critical"] = critical;
+    }
+    else
+    {
+        ret["last_good_ledger"] = static_cast<Json::UInt64>(
+            mLastQuorumMapIntersectionState.mLastGoodLedger);
+        Json::Value split, a, b;
+        auto const& pair = mLastQuorumMapIntersectionState.mPotentialSplit;
+        for (auto const& k : pair.first)
+        {
+            auto s = mApp.getConfig().toStrKey(k, fullKeys);
+            a.append(s);
+        }
+        for (auto const& k : pair.second)
+        {
+            auto s = mApp.getConfig().toStrKey(k, fullKeys);
+            b.append(s);
+        }
+        split.append(a);
+        split.append(b);
+        ret["potential_split"] = split;
+    }
     return ret;
 }
 
@@ -887,8 +941,13 @@ HerderImpl::getJsonQuorumInfo(NodeID const& id, bool summary, bool fullKeys,
                               uint64 index)
 {
     Json::Value ret;
-    ret["node"] = mApp.getConfig().toStrKey(id);
-    ret["slots"] = getSCP().getJsonQuorumInfo(id, summary, fullKeys, index);
+    ret["node"] = mApp.getConfig().toStrKey(id, fullKeys);
+    ret["qset"] = getSCP().getJsonQuorumInfo(id, summary, fullKeys, index);
+    bool isSelf = id == mApp.getConfig().NODE_SEED.getPublicKey();
+    if (isSelf && mLastQuorumMapIntersectionState.hasAnyResults())
+    {
+        ret["transitive"] = getJsonTransitiveQuorumIntersectionInfo(fullKeys);
+    }
     return ret;
 }
 
@@ -897,6 +956,12 @@ HerderImpl::getJsonTransitiveQuorumInfo(NodeID const& rootID, bool summary,
                                         bool fullKeys)
 {
     Json::Value ret;
+    bool isSelf = rootID == mApp.getConfig().NODE_SEED.getPublicKey();
+    if (isSelf && mLastQuorumMapIntersectionState.hasAnyResults())
+    {
+        ret = getJsonTransitiveQuorumIntersectionInfo(fullKeys);
+    }
+
     Json::Value& nodes = ret["nodes"];
 
     auto& q = mPendingEnvelopes.getCurrentlyTrackedQuorum();
@@ -920,8 +985,7 @@ HerderImpl::getJsonTransitiveQuorumInfo(NodeID const& rootID, bool summary,
         {
             Json::Value cur;
             valGenID++;
-            cur["node"] = fullKeys ? mApp.getConfig().toStrKey(id)
-                                   : mApp.getConfig().toShortString(id);
+            cur["node"] = mApp.getConfig().toStrKey(id, fullKeys);
             if (!summary)
             {
                 cur["distance"] = distance;
@@ -1011,6 +1075,87 @@ HerderImpl::getJsonTransitiveQuorumInfo(NodeID const& rootID, bool summary,
     return ret;
 }
 
+QuorumTracker::QuorumMap const&
+HerderImpl::getCurrentlyTrackedQuorum() const
+{
+    return mPendingEnvelopes.getCurrentlyTrackedQuorum();
+}
+
+static Hash
+getQmapHash(QuorumTracker::QuorumMap const& qmap)
+{
+    std::unique_ptr<SHA256> hasher = SHA256::create();
+    std::map<NodeID, SCPQuorumSetPtr> ordered_map(qmap.begin(), qmap.end());
+    for (auto const& pair : ordered_map)
+    {
+        hasher->add(xdr::xdr_to_opaque(pair.first));
+        if (pair.second)
+        {
+            hasher->add(xdr::xdr_to_opaque(*pair.second));
+        }
+        else
+        {
+            hasher->add("\0");
+        }
+    }
+    return hasher->finish();
+}
+
+void
+HerderImpl::checkAndMaybeReanalyzeQuorumMap()
+{
+    if (!mApp.getConfig().QUORUM_INTERSECTION_CHECKER)
+    {
+        return;
+    }
+    if (!mLastQuorumMapIntersectionState.mRecalculating)
+    {
+        QuorumTracker::QuorumMap const& qmap = getCurrentlyTrackedQuorum();
+        Hash curr = getQmapHash(qmap);
+        if (mLastQuorumMapIntersectionState.mLastCheckQuorumMapHash != curr)
+        {
+            CLOG(INFO, "Herder")
+                << "Transitive closure of quorum has changed, re-analyzing.";
+            mLastQuorumMapIntersectionState.mRecalculating = true;
+            auto& cfg = mApp.getConfig();
+            auto ledger = getCurrentLedgerSeq();
+            auto nNodes = qmap.size();
+            auto qic = QuorumIntersectionChecker::create(qmap, cfg);
+            auto& hState = mLastQuorumMapIntersectionState;
+            auto& app = mApp;
+            auto worker = [curr, ledger, nNodes, qic, qmap, cfg, &app,
+                           &hState] {
+                bool ok = qic->networkEnjoysQuorumIntersection();
+                auto split = qic->getPotentialSplit();
+                std::set<std::set<PublicKey>> critical;
+                if (ok)
+                {
+                    // Only bother calculating the _critical_ groups if we're
+                    // intersecting; if not intersecting we should finish ASAP
+                    // and raise an alarm.
+                    critical = QuorumIntersectionChecker::
+                        getIntersectionCriticalGroups(qmap, cfg);
+                }
+                app.postOnMainThread(
+                    [ok, curr, ledger, nNodes, split, critical, &hState] {
+                        hState.mRecalculating = false;
+                        hState.mNumNodes = nNodes;
+                        hState.mLastCheckLedger = ledger;
+                        hState.mLastCheckQuorumMapHash = curr;
+                        hState.mPotentialSplit = split;
+                        hState.mIntersectionCriticalNodes = critical;
+                        if (ok)
+                        {
+                            hState.mLastGoodLedger = ledger;
+                        }
+                    },
+                    "QuorumIntersectionChecker");
+            };
+            mApp.postOnBackgroundThread(worker, "QuorumIntersectionChecker");
+        }
+    }
+}
+
 void
 HerderImpl::persistSCPState(uint64 slot)
 {
@@ -1065,7 +1210,7 @@ HerderImpl::persistSCPState(uint64 slot)
     std::string scpState;
     scpState = decoder::encode_b64(latestSCPData);
 
-    mApp.getPersistentState().setState(PersistentState::kLastSCPData, scpState);
+    mApp.getPersistentState().setSCPStateForSlot(slot, scpState);
 }
 
 void
@@ -1086,56 +1231,52 @@ HerderImpl::restoreSCPState()
     trackingHeartBeat();
 
     // load saved state from database
-    auto latest64 =
-        mApp.getPersistentState().getState(PersistentState::kLastSCPData);
-
-    if (latest64.empty())
+    auto latest64 = mApp.getPersistentState().getSCPStateAllSlots();
+    for (auto const& state : latest64)
     {
-        return;
+        std::vector<uint8_t> buffer;
+        decoder::decode_b64(state, buffer);
+
+        xdr::xvector<SCPEnvelope> latestEnvs;
+        xdr::xvector<TransactionSet> latestTxSets;
+        xdr::xvector<SCPQuorumSet> latestQSets;
+
+        try
+        {
+            xdr::xdr_from_opaque(buffer, latestEnvs, latestTxSets, latestQSets);
+
+            for (auto const& txset : latestTxSets)
+            {
+                TxSetFramePtr cur =
+                    make_shared<TxSetFrame>(mApp.getNetworkID(), txset);
+                Hash h = cur->getContentsHash();
+                mPendingEnvelopes.addTxSet(h, 0, cur);
+            }
+            for (auto const& qset : latestQSets)
+            {
+                Hash hash = sha256(xdr::xdr_to_opaque(qset));
+                mPendingEnvelopes.addSCPQuorumSet(hash, qset);
+            }
+            for (auto const& e : latestEnvs)
+            {
+                getSCP().setStateFromEnvelope(e.statement.slotIndex, e);
+                mLastSlotSaved =
+                    std::max<uint64>(mLastSlotSaved, e.statement.slotIndex);
+            }
+        }
+        catch (std::exception& e)
+        {
+            // we may have exceptions when upgrading the protocol
+            // this should be the only time we get exceptions decoding old
+            // messages.
+            CLOG(INFO, "Herder") << "Error while restoring old scp messages, "
+                                    "proceeding without them : "
+                                 << e.what();
+        }
+        mPendingEnvelopes.rebuildQuorumTrackerState();
     }
 
-    std::vector<uint8_t> buffer;
-    decoder::decode_b64(latest64, buffer);
-
-    xdr::xvector<SCPEnvelope> latestEnvs;
-    xdr::xvector<TransactionSet> latestTxSets;
-    xdr::xvector<SCPQuorumSet> latestQSets;
-
-    try
-    {
-        xdr::xdr_from_opaque(buffer, latestEnvs, latestTxSets, latestQSets);
-
-        for (auto const& txset : latestTxSets)
-        {
-            TxSetFramePtr cur =
-                make_shared<TxSetFrame>(mApp.getNetworkID(), txset);
-            Hash h = cur->getContentsHash();
-            mPendingEnvelopes.addTxSet(h, 0, cur);
-        }
-        for (auto const& qset : latestQSets)
-        {
-            Hash hash = sha256(xdr::xdr_to_opaque(qset));
-            mPendingEnvelopes.addSCPQuorumSet(hash, qset);
-        }
-        for (auto const& e : latestEnvs)
-        {
-            getSCP().setStateFromEnvelope(e.statement.slotIndex, e);
-        }
-
-        if (latestEnvs.size() != 0)
-        {
-            mLastSlotSaved = latestEnvs.back().statement.slotIndex;
-            startRebroadcastTimer();
-        }
-    }
-    catch (std::exception& e)
-    {
-        // we may have exceptions when upgrading the protocol
-        // this should be the only time we get exceptions decoding old messages.
-        CLOG(INFO, "Herder") << "Error while restoring old scp messages, "
-                                "proceeding without them : "
-                             << e.what();
-    }
+    startRebroadcastTimer();
 }
 
 void
@@ -1194,7 +1335,7 @@ HerderImpl::updateTransactionQueue(
     std::vector<TransactionFramePtr> const& applied)
 {
     // remove all these tx from mTransactionQueue
-    mTransactionQueue.remove(applied);
+    mTransactionQueue.removeAndReset(applied);
     mTransactionQueue.shift();
 
     // rebroadcast entries, sorted in apply-order to maximize chances of

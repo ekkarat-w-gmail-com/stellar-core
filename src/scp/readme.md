@@ -24,4 +24,4 @@ The `stellar-core` program has a single subclass of SCPDriver called
 ([Overlay](../overlay)) and specific replicated state machine
 ([LedgerManager](../ledger)).
 
-For details of the protocol itself, see the [paper on SCP](https://www.stellar.org/papers/stellar-consensus-protocol.pdf).
+For details of the protocol itself, see the [paper on SCP](https://www.ekkarat.w@gmail.com/papers/stellar-consensus-protocol.pdf).

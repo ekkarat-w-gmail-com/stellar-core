@@ -34,7 +34,14 @@ class HistoryManagerImpl : public HistoryManager
     medida::Meter& mPublishSuccess;
     medida::Meter& mPublishFailure;
 
+    medida::Timer& mEnqueueToPublishTimer;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>
+        mEnqueueTimes;
+
     PublishQueueBuckets::BucketCount loadBucketsReferencedByPublishQueue();
+#ifdef BUILD_TESTS
+    bool mPublicationEnabled{true};
+#endif
 
   public:
     HistoryManagerImpl(Application& app);
@@ -66,19 +73,15 @@ class HistoryManagerImpl : public HistoryManager
 
     std::vector<std::string> getBucketsReferencedByPublishQueue() override;
 
-    std::vector<HistoryArchiveState> getPublishQueueStates();
+    std::vector<HistoryArchiveState> getPublishQueueStates() override;
 
     void historyPublished(uint32_t ledgerSeq,
                           std::vector<std::string> const& originalBuckets,
                           bool success) override;
 
-    void downloadMissingBuckets(
-        HistoryArchiveState desiredState,
-        std::function<void(asio::error_code const& ec)> handler) override;
-
     HistoryArchiveState getLastClosedHistoryArchiveState() const override;
 
-    InferredQuorum inferQuorum() override;
+    InferredQuorum inferQuorum(uint32_t ledgerNum) override;
 
     std::string const& getTmpDir() override;
 
@@ -87,5 +90,9 @@ class HistoryManagerImpl : public HistoryManager
     uint64_t getPublishQueueCount() override;
     uint64_t getPublishSuccessCount() override;
     uint64_t getPublishFailureCount() override;
+
+#ifdef BUILD_TESTS
+    void setPublicationEnabled(bool enabled) override;
+#endif
 };
 }

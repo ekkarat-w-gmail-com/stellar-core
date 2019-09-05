@@ -282,76 +282,11 @@ LedgerTxnRoot::Impl::dropData()
     mDatabase.getSession() << "CREATE TABLE accountdata"
                               "("
                               "accountid    VARCHAR(56)  NOT NULL,"
-                              "dataname     VARCHAR(64)  NOT NULL,"
+                              "dataname     VARCHAR(88)  NOT NULL,"
                               "datavalue    VARCHAR(112) NOT NULL,"
                               "lastmodified INT          NOT NULL,"
                               "PRIMARY KEY  (accountid, dataname)"
                               ");";
-}
-
-static std::vector<LedgerEntry>
-loadDataToEncode(Database& db)
-{
-    std::string accountID, dataName, dataValue;
-    uint32_t lastModified;
-
-    std::string sql = "SELECT accountid, dataname, datavalue, lastmodified "
-                      "FROM accountdata";
-
-    auto prep = db.getPreparedStatement(sql);
-    auto& st = prep.statement();
-    st.exchange(soci::into(accountID));
-    st.exchange(soci::into(dataName));
-    st.exchange(soci::into(dataValue));
-    st.exchange(soci::into(lastModified));
-    st.define_and_bind();
-    st.execute(true);
-
-    std::vector<LedgerEntry> res;
-    while (st.got_data())
-    {
-        res.emplace_back();
-        auto& le = res.back();
-        le.data.type(DATA);
-
-        auto& de = le.data.data();
-        de.accountID = KeyUtils::fromStrKey<PublicKey>(accountID);
-        de.dataName = dataName;
-        decoder::decode_b64(dataValue, de.dataValue);
-        le.lastModifiedLedgerSeq = lastModified;
-
-        st.fetch();
-    }
-    return res;
-}
-
-void
-LedgerTxnRoot::Impl::encodeDataNamesBase64()
-{
-    throwIfChild();
-    mEntryCache.clear();
-    mBestOffersCache.clear();
-
-    CLOG(INFO, "Ledger")
-        << "Loading all data entries from the accountdata table";
-    auto dataToEncode = loadDataToEncode(mDatabase);
-
-    // Note: The table must be recreated since dataname is part of the primary
-    // key, so there could be a collision when updating it
-    dropData();
-    if (!mDatabase.isSqlite())
-    {
-        auto& session = mDatabase.getSession();
-        session << "ALTER TABLE accountdata ALTER COLUMN dataname "
-                   "SET DATA TYPE VARCHAR(88)";
-    }
-    if (!dataToEncode.empty())
-    {
-        BulkUpsertDataOperation op(mDatabase, dataToEncode);
-        mDatabase.doDatabaseTypeSpecificOperation(op);
-        CLOG(INFO, "Ledger")
-            << "Wrote " << dataToEncode.size() << " data entries";
-    }
 }
 
 class BulkLoadDataOperation
@@ -437,8 +372,13 @@ class BulkLoadDataOperation
             "FROM accountdata WHERE (accountid, dataname) IN r";
 
         auto prep = mDb.getPreparedStatement(sql);
-        auto sqliteStatement = dynamic_cast<soci::sqlite3_statement_backend*>(
-            prep.statement().get_backend());
+        auto be = prep.statement().get_backend();
+        if (be == nullptr)
+        {
+            throw std::runtime_error("no sql backend");
+        }
+        auto sqliteStatement =
+            dynamic_cast<soci::sqlite3_statement_backend*>(be);
         auto st = sqliteStatement->stmt_;
 
         sqlite3_reset(st);

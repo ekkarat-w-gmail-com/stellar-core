@@ -26,7 +26,7 @@ ApplyBucketsWork::ApplyBucketsWork(
     Application& app,
     std::map<std::string, std::shared_ptr<Bucket>> const& buckets,
     HistoryArchiveState const& applyState, uint32_t maxProtocolVersion)
-    : BasicWork(app, "apply-buckets", RETRY_A_FEW)
+    : BasicWork(app, "apply-buckets", BasicWork::RETRY_NEVER)
     , mBuckets(buckets)
     , mApplyState(applyState)
     , mApplying(false)
@@ -63,6 +63,8 @@ ApplyBucketsWork::getBucket(std::string const& hash)
 void
 ApplyBucketsWork::onReset()
 {
+    CLOG(INFO, "History") << "Applying buckets";
+
     mTotalBuckets = 0;
     mAppliedBuckets = 0;
     mAppliedEntries = 0;
@@ -182,7 +184,6 @@ ApplyBucketsWork::onRun()
         mBucketApplySuccess.Mark();
     }
 
-    mApp.getCatchupManager().logAndUpdateCatchupStatus(true);
     if (mLevel != 0)
     {
         --mLevel;

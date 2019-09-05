@@ -80,7 +80,7 @@ struct HistoryArchiveState
                                  std::string const& archiveName);
 
     // Return cumulative hash of the bucketlist for this archive state.
-    Hash getBucketListHash();
+    Hash getBucketListHash() const;
 
     // Return vector of buckets to fetch/apply to turn 'other' into 'this'.
     // Vector is sorted from largest/highest-numbered bucket to smallest/lowest,
@@ -107,11 +107,6 @@ struct HistoryArchiveState
         ar(CEREAL_NVP(version), CEREAL_NVP(server), CEREAL_NVP(currentLedger),
            CEREAL_NVP(currentBuckets));
     }
-
-    // Return true if all the 'next' bucket-futures that can be resolved are
-    // ready to be (instantaneously) resolved, or false if a merge is still
-    // in progress on one or more of them.
-    bool futuresAllReady() const;
 
     // Return true if all futures have already been resolved, otherwise false.
     bool futuresAllResolved() const;

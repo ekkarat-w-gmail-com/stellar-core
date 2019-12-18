@@ -14,6 +14,7 @@
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnHeader.h"
 #include "lib/catch.hpp"
+#include "main/ApplicationUtils.h"
 #include "test/TestAccount.h"
 #include "test/TestUtils.h"
 #include "test/TxTests.h"
@@ -39,21 +40,20 @@ HistoryConfigurator::getArchiveDirName() const
 }
 
 TmpDirHistoryConfigurator::TmpDirHistoryConfigurator()
-    : mArchtmp("archtmp-" + binToHex(randomBytes(8)))
-    , mDir(mArchtmp.tmpDir("archive"))
+    : mName("archtmp-" + binToHex(randomBytes(8))), mArchtmp(mName)
 {
 }
 
 std::string
 TmpDirHistoryConfigurator::getArchiveDirName() const
 {
-    return mDir.getName();
+    return mName;
 }
 
 Config&
-TmpDirHistoryConfigurator::configure(Config& mCfg, bool writable) const
+TmpDirHistoryConfigurator::configure(Config& cfg, bool writable) const
 {
-    std::string d = mDir.getName();
+    std::string d = getArchiveDirName();
     std::string getCmd = "cp " + d + "/{0} {1}";
     std::string putCmd = "";
     std::string mkdirCmd = "";
@@ -64,24 +64,30 @@ TmpDirHistoryConfigurator::configure(Config& mCfg, bool writable) const
         mkdirCmd = "mkdir -p " + d + "/{0}";
     }
 
-    mCfg.HISTORY["test"] =
-        HistoryArchiveConfiguration{"test", getCmd, putCmd, mkdirCmd};
-    return mCfg;
+    cfg.HISTORY[d] = HistoryArchiveConfiguration{d, getCmd, putCmd, mkdirCmd};
+    return cfg;
 }
 
-ProtocolVersionTmpDirHistoryConfigurator::
-    ProtocolVersionTmpDirHistoryConfigurator(uint32_t version)
-    : mProtocolVersion(version)
+MultiArchiveHistoryConfigurator::MultiArchiveHistoryConfigurator(
+    uint32_t numArchives)
 {
+    while (numArchives > 0)
+    {
+        auto conf = std::make_shared<TmpDirHistoryConfigurator>();
+        mConfigurators.emplace_back(conf);
+        --numArchives;
+    }
 }
 
 Config&
-ProtocolVersionTmpDirHistoryConfigurator::configure(Config& mCfg,
-                                                    bool writable) const
+MultiArchiveHistoryConfigurator::configure(Config& cfg, bool writable) const
 {
-    TmpDirHistoryConfigurator::configure(mCfg, writable);
-    mCfg.LEDGER_PROTOCOL_VERSION = mProtocolVersion;
-    return mCfg;
+    for (auto const& conf : mConfigurators)
+    {
+        conf->configure(cfg, writable);
+    }
+    REQUIRE(cfg.HISTORY.size() == mConfigurators.size());
+    return cfg;
 }
 
 Config&
@@ -109,10 +115,20 @@ S3HistoryConfigurator::configure(Config& mCfg, bool writable) const
     return mCfg;
 }
 
+Config&
+RealGenesisTmpDirHistoryConfigurator::configure(Config& mCfg,
+                                                bool writable) const
+{
+    TmpDirHistoryConfigurator::configure(mCfg, writable);
+    mCfg.USE_CONFIG_FOR_GENESIS = false;
+    return mCfg;
+}
+
 BucketOutputIteratorForTesting::BucketOutputIteratorForTesting(
     std::string const& tmpDir, uint32_t protocolVersion, MergeCounters& mc)
     : BucketOutputIterator{tmpDir, true,
-                           testutil::testBucketMetadata(protocolVersion), mc}
+                           testutil::testBucketMetadata(protocolVersion), mc,
+                           /*doFsync=*/true}
 {
 }
 
@@ -171,12 +187,10 @@ TestBucketGenerator::generateBucket(TestBucketState state)
         FileTransferInfo ft{mTmpDir->getName(), HISTORY_FILE_TYPE_BUCKET,
                             binToHex(hash)};
         auto& wm = mApp.getWorkScheduler();
-        auto archive =
-            mApp.getHistoryArchiveManager().getHistoryArchive("test");
         auto put = std::make_shared<PutRemoteFileWork>(
-            mApp, filename + ".gz", ft.remoteName(), archive);
+            mApp, filename + ".gz", ft.remoteName(), mArchive);
         auto mkdir =
-            std::make_shared<MakeRemoteDirWork>(mApp, ft.remoteDir(), archive);
+            std::make_shared<MakeRemoteDirWork>(mApp, ft.remoteDir(), mArchive);
 
         std::vector<std::shared_ptr<BasicWork>> seq;
 
@@ -217,7 +231,7 @@ TestLedgerChainGenerator::createHistoryFiles(
     uint32_t checkpoint)
 {
     FileTransferInfo ft{mTmpDir, HISTORY_FILE_TYPE_LEDGER, checkpoint};
-    XDROutputFileStream ledgerOut;
+    XDROutputFileStream ledgerOut(/*doFsync=*/true);
     ledgerOut.open(ft.localPath_nogz());
 
     for (auto& ledger : lhv)
@@ -266,11 +280,11 @@ TestLedgerChainGenerator::makeLedgerChainFiles(
     LedgerHeaderHistoryEntry beginRange;
 
     LedgerHeaderHistoryEntry first, last;
-    for (auto i = mCheckpointRange.first(); i <= mCheckpointRange.last();
+    for (auto i = mCheckpointRange.mFirst; i <= mCheckpointRange.mLast;
          i += mApp.getHistoryManager().getCheckpointFrequency())
     {
         // Only corrupt first checkpoint (last to be verified)
-        if (i != mCheckpointRange.first())
+        if (i != mCheckpointRange.mFirst)
         {
             state = HistoryManager::VERIFY_STATUS_OK;
         }
@@ -402,7 +416,8 @@ operator!=(CatchupPerformedWork const& x, CatchupPerformedWork const& y)
 }
 
 CatchupSimulation::CatchupSimulation(VirtualClock::Mode mode,
-                                     std::shared_ptr<HistoryConfigurator> cg)
+                                     std::shared_ptr<HistoryConfigurator> cg,
+                                     bool startApp)
     : mClock(mode)
     , mHistoryConfigurator(cg)
     , mCfg(getTestConfig())
@@ -410,8 +425,16 @@ CatchupSimulation::CatchupSimulation(VirtualClock::Mode mode,
           mClock, mHistoryConfigurator->configure(mCfg, true)))
     , mApp(*mAppPtr)
 {
-    CHECK(mApp.getHistoryArchiveManager().initializeHistoryArchive("test"));
-    mApp.start();
+    auto dirName = cg->getArchiveDirName();
+    if (!dirName.empty())
+    {
+        CHECK(
+            mApp.getHistoryArchiveManager().initializeHistoryArchive(dirName));
+    }
+    if (startApp)
+    {
+        mApp.start();
+    }
 }
 
 CatchupSimulation::~CatchupSimulation()
@@ -426,7 +449,7 @@ CatchupSimulation::getLastCheckpointLedger(uint32_t checkpointIndex) const
 }
 
 void
-CatchupSimulation::generateRandomLedger()
+CatchupSimulation::generateRandomLedger(uint32_t version)
 {
     auto& lm = mApp.getLedgerManager();
     TxSetFramePtr txSet =
@@ -444,16 +467,20 @@ CatchupSimulation::generateRandomLedger()
     auto carol = TestAccount{mApp, getAccount("carol")};
 
     // Root sends to alice every tx, bob every other tx, carol every 4rd tx.
-    txSet->add(root.tx({createAccount(alice, big)}));
-    txSet->add(root.tx({createAccount(bob, big)}));
-    txSet->add(root.tx({createAccount(carol, big)}));
-    txSet->add(root.tx({payment(alice, big)}));
-    txSet->add(root.tx({payment(bob, big)}));
-    txSet->add(root.tx({payment(carol, big)}));
-
-    // They all randomly send a little to one another every ledger after #4
-    if (ledgerSeq > 4)
+    if (ledgerSeq < 5)
     {
+        txSet->add(root.tx({createAccount(alice, big)}));
+        txSet->add(root.tx({createAccount(bob, big)}));
+        txSet->add(root.tx({createAccount(carol, big)}));
+    }
+    // Allow an occasional empty ledger
+    else if (rand_flip() || rand_flip())
+    {
+        txSet->add(root.tx({payment(alice, big)}));
+        txSet->add(root.tx({payment(bob, big)}));
+        txSet->add(root.tx({payment(carol, big)}));
+
+        // They all randomly send a little to one another every ledger after #4
         if (rand_flip())
             txSet->add(alice.tx({payment(bob, small)}));
         if (rand_flip())
@@ -477,7 +504,16 @@ CatchupSimulation::generateRandomLedger()
                            << " with " << txSet->sizeTx() << " txs (txhash:"
                            << hexAbbrev(txSet->getContentsHash()) << ")";
 
-    StellarValue sv(txSet->getContentsHash(), closeTime, emptyUpgradeSteps,
+    auto upgrades = xdr::xvector<UpgradeType, 6>{};
+    if (version > 0)
+    {
+        auto ledgerUpgrade = LedgerUpgrade{LEDGER_UPGRADE_VERSION};
+        ledgerUpgrade.newLedgerVersion() = version;
+        auto v = xdr::xdr_to_opaque(ledgerUpgrade);
+        upgrades.push_back(UpgradeType{v.begin(), v.end()});
+    }
+
+    StellarValue sv(txSet->getContentsHash(), closeTime, upgrades,
                     STELLAR_VALUE_BASIC);
     mLedgerCloseDatas.emplace_back(ledgerSeq, txSet, sv);
     lm.closeLedger(mLedgerCloseDatas.back());
@@ -509,13 +545,29 @@ CatchupSimulation::generateRandomLedger()
 }
 
 void
+CatchupSimulation::setProto12UpgradeLedger(uint32_t ledger)
+{
+    REQUIRE(mApp.getLedgerManager().getLastClosedLedgerNum() < ledger);
+    mTestProtocolShadowsRemovedLedgerSeq = ledger;
+}
+
+void
 CatchupSimulation::ensureLedgerAvailable(uint32_t targetLedger)
 {
     auto& lm = mApp.getLedgerManager();
     auto& hm = mApp.getHistoryManager();
     while (lm.getLastClosedLedgerNum() < targetLedger)
     {
-        generateRandomLedger();
+        if (lm.getLastClosedLedgerNum() + 1 ==
+            mTestProtocolShadowsRemovedLedgerSeq)
+        {
+            // Force proto 12 upgrade
+            generateRandomLedger(Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED);
+        }
+        else
+        {
+            generateRandomLedger();
+        }
 
         auto seq = mApp.getLedgerManager().getLastClosedLedgerNum() + 1;
         if (seq == hm.nextCheckpointLedger(seq))
@@ -538,6 +590,8 @@ CatchupSimulation::ensurePublishesComplete()
     }
 
     REQUIRE(hm.getPublishFailureCount() == 0);
+    // Make sure all references to buckets were released
+    REQUIRE(hm.getBucketsReferencedByPublishQueue().empty());
 }
 
 void
@@ -569,7 +623,7 @@ CatchupSimulation::crankUntil(Application::pointer app,
                               VirtualClock::duration timeout)
 {
     auto start = std::chrono::system_clock::now();
-    while (!app->getWorkScheduler().allChildrenDone() || !predicate())
+    while (!predicate())
     {
         app->getClock().crank(false);
         auto current = std::chrono::system_clock::now();
@@ -585,7 +639,7 @@ Application::pointer
 CatchupSimulation::createCatchupApplication(uint32_t count,
                                             Config::TestDbMode dbMode,
                                             std::string const& appName,
-                                            uint32_t protocolVersion)
+                                            bool publish)
 {
     CLOG(INFO, "History") << "****";
     CLOG(INFO, "History") << "**** Create app for catchup: '" << appName << "'";
@@ -596,15 +650,15 @@ CatchupSimulation::createCatchupApplication(uint32_t count,
     mCfgs.back().CATCHUP_COMPLETE =
         count == std::numeric_limits<uint32_t>::max();
     mCfgs.back().CATCHUP_RECENT = count;
-    mCfgs.back().LEDGER_PROTOCOL_VERSION = protocolVersion;
     mSpawnedAppsClocks.emplace_front();
     return createTestApplication(
         mSpawnedAppsClocks.front(),
-        mHistoryConfigurator->configure(mCfgs.back(), false));
+        mHistoryConfigurator->configure(mCfgs.back(), publish));
 }
 
 bool
-CatchupSimulation::catchupOffline(Application::pointer app, uint32_t toLedger)
+CatchupSimulation::catchupOffline(Application::pointer app, uint32_t toLedger,
+                                  bool extraValidation)
 {
     CLOG(INFO, "History") << "starting offline catchup with toLedger="
                           << toLedger;
@@ -612,17 +666,22 @@ CatchupSimulation::catchupOffline(Application::pointer app, uint32_t toLedger)
     auto startCatchupMetrics = getCatchupMetrics(app);
     auto& lm = app->getLedgerManager();
     auto lastLedger = lm.getLastClosedLedgerNum();
+    auto mode = extraValidation ? CatchupConfiguration::Mode::OFFLINE_COMPLETE
+                                : CatchupConfiguration::Mode::OFFLINE_BASIC;
     auto catchupConfiguration =
-        CatchupConfiguration{toLedger, app->getConfig().CATCHUP_RECENT,
-                             CatchupConfiguration::Mode::OFFLINE};
-    lm.startCatchup(catchupConfiguration);
+        CatchupConfiguration{toLedger, app->getConfig().CATCHUP_RECENT, mode};
+    lm.startCatchup(catchupConfiguration, nullptr);
     REQUIRE(!app->getClock().getIOContext().stopped());
 
-    auto caughtUp = [&]() { return lm.isSynced(); };
-    crankUntil(app, caughtUp, std::chrono::seconds{30});
+    auto finished = [&]() {
+        return lm.isSynced() ||
+               lm.getState() == LedgerManager::LM_BOOTING_STATE;
+    };
+    crankUntil(app, finished, std::chrono::seconds{30});
 
-    auto result = caughtUp();
-    if (result)
+    // Finished successfully
+    auto success = lm.isSynced();
+    if (success)
     {
         CLOG(INFO, "History") << "Caught up";
 
@@ -632,11 +691,17 @@ CatchupSimulation::catchupOffline(Application::pointer app, uint32_t toLedger)
 
         REQUIRE(catchupPerformedWork ==
                 computeCatchupPerformedWork(lastLedger, catchupConfiguration,
-                                            app->getHistoryManager()));
+                                            *app));
+        if (app->getHistoryArchiveManager().hasAnyWritableHistoryArchive())
+        {
+            auto& hm = app->getHistoryManager();
+            REQUIRE(hm.getPublishQueueCount() - hm.getPublishSuccessCount() <=
+                    CatchupWork::PUBLISH_QUEUE_MAX_SIZE);
+        }
     }
 
     validateCatchup(app);
-    return result;
+    return success;
 }
 
 bool
@@ -716,7 +781,7 @@ CatchupSimulation::catchupOnline(Application::pointer app, uint32_t initLedger,
 
         REQUIRE(catchupPerformedWork ==
                 computeCatchupPerformedWork(lastLedger, catchupConfiguration,
-                                            app->getHistoryManager()));
+                                            *app));
 
         CLOG(INFO, "History") << "Caught up";
     }
@@ -877,36 +942,39 @@ CatchupSimulation::getCatchupMetrics(Application::pointer app)
 CatchupPerformedWork
 CatchupSimulation::computeCatchupPerformedWork(
     uint32_t lastClosedLedger, CatchupConfiguration const& catchupConfiguration,
-    HistoryManager const& historyManager)
+    Application& app)
 {
-    auto catchupRange = CatchupWork::makeCatchupRange(
-        lastClosedLedger, catchupConfiguration, historyManager);
-    auto checkpointRange = CheckpointRange{catchupRange.first, historyManager};
+    auto const& hm = app.getHistoryManager();
+
+    auto catchupRange =
+        CatchupRange{lastClosedLedger, catchupConfiguration, hm};
+    auto verifyCheckpointRange = CheckpointRange{
+        {catchupRange.mLedgers.mFirst - 1, catchupRange.getLast()}, hm};
+    auto applyCheckpointRange = CheckpointRange{
+        {catchupRange.mLedgers.mFirst, catchupRange.getLast()}, hm};
 
     uint32_t historyArchiveStatesDownloaded = 1;
-    if (catchupRange.second &&
-        checkpointRange.first() != checkpointRange.last())
+    if (catchupRange.mApplyBuckets &&
+        verifyCheckpointRange.mFirst != verifyCheckpointRange.mLast)
     {
         historyArchiveStatesDownloaded++;
     }
 
-    auto filesDownloaded = checkpointRange.count();
-    auto firstVerifiedLedger = std::max(
-        LedgerManager::GENESIS_LEDGER_SEQ,
-        checkpointRange.first() + 1 - historyManager.getCheckpointFrequency());
+    auto ledgersDownloaded = verifyCheckpointRange.count();
+    auto transactionsDownloaded = applyCheckpointRange.count();
+    auto firstVerifiedLedger = std::max(LedgerManager::GENESIS_LEDGER_SEQ,
+                                        verifyCheckpointRange.mFirst + 1 -
+                                            hm.getCheckpointFrequency());
     auto ledgersVerified =
         catchupConfiguration.toLedger() - firstVerifiedLedger + 1;
-    auto transactionsApplied =
-        catchupRange.second
-            ? catchupConfiguration.toLedger() - checkpointRange.first()
-            : catchupConfiguration.toLedger() - lastClosedLedger;
+    auto transactionsApplied = catchupRange.mLedgers.mCount;
     return {historyArchiveStatesDownloaded,
-            filesDownloaded,
+            ledgersDownloaded,
             ledgersVerified,
             0,
-            catchupRange.second,
-            catchupRange.second,
-            filesDownloaded,
+            catchupRange.mApplyBuckets,
+            catchupRange.mApplyBuckets,
+            transactionsDownloaded,
             transactionsApplied};
 }
 }

@@ -70,21 +70,25 @@ CommandHandler::CommandHandler(Application& app) : mApp(app)
 
     mServer->add404(std::bind(&CommandHandler::fileNotFound, this, _1, _2));
 
+    if (mApp.modeHasDatabase())
+    {
+        addRoute("dropcursor", &CommandHandler::dropcursor);
+        addRoute("getcursor", &CommandHandler::getcursor);
+        addRoute("setcursor", &CommandHandler::setcursor);
+        addRoute("maintenance", &CommandHandler::maintenance);
+    }
+
     addRoute("bans", &CommandHandler::bans);
     addRoute("clearmetrics", &CommandHandler::clearMetrics);
     addRoute("connect", &CommandHandler::connect);
-    addRoute("dropcursor", &CommandHandler::dropcursor);
     addRoute("droppeer", &CommandHandler::dropPeer);
-    addRoute("getcursor", &CommandHandler::getcursor);
     addRoute("info", &CommandHandler::info);
     addRoute("ll", &CommandHandler::ll);
     addRoute("logrotate", &CommandHandler::logRotate);
-    addRoute("maintenance", &CommandHandler::maintenance);
     addRoute("manualclose", &CommandHandler::manualClose);
     addRoute("metrics", &CommandHandler::metrics);
     addRoute("peers", &CommandHandler::peers);
     addRoute("quorum", &CommandHandler::quorum);
-    addRoute("setcursor", &CommandHandler::setcursor);
     addRoute("scp", &CommandHandler::scpInfo);
     addRoute("tx", &CommandHandler::tx);
     addRoute("unban", &CommandHandler::unban);
@@ -201,8 +205,12 @@ parseParam(std::map<std::string, std::string> const& map,
 }
 
 void
-CommandHandler::peers(std::string const&, std::string& retStr)
+CommandHandler::peers(std::string const& params, std::string& retStr)
 {
+    std::map<std::string, std::string> retMap;
+    http::server::server::parseParams(params, retMap);
+
+    bool fullKeys = retMap["fullkeys"] == "true";
     Json::Value root;
 
     auto& pendingPeers = root["pending_peers"];
@@ -230,9 +238,11 @@ CommandHandler::peers(std::string const&, std::string& retStr)
             {
                 auto& peerNode = node[counter++];
                 peerNode["address"] = peer.second->toString();
+                peerNode["elapsed"] = (int)peer.second->getLifeTime().count();
                 peerNode["ver"] = peer.second->getRemoteVersion();
                 peerNode["olver"] = (int)peer.second->getRemoteOverlayVersion();
-                peerNode["id"] = mApp.getConfig().toStrKey(peer.first);
+                peerNode["id"] =
+                    mApp.getConfig().toStrKey(peer.first, fullKeys);
             }
         };
     addAuthenticatedPeers(
@@ -506,10 +516,10 @@ CommandHandler::ll(std::string const& params, std::string& retStr)
     }
     else
     {
-        partition = Logging::normalizePartition(partition);
         el::Level level = Logging::getLLfromString(levelStr);
         if (partition.size())
         {
+            partition = Logging::normalizePartition(partition);
             Logging::setLogLevel(level, partition.c_str());
             root[partition] = Logging::getStringFromLL(level);
         }

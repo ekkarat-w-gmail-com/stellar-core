@@ -39,33 +39,9 @@ StateSnapshot::StateSnapshot(Application& app, HistoryArchiveState const& state)
           mSnapDir, HISTORY_FILE_TYPE_SCP, mLocalState.currentLedger))
 
 {
-    makeLive();
-}
-
-void
-StateSnapshot::makeLive()
-{
-    for (uint32_t i = 0;
-         i < static_cast<uint32>(mLocalState.currentBuckets.size()); i++)
+    if (mLocalState.currentBuckets.size() != BucketList::kNumLevels)
     {
-        auto& hb = mLocalState.currentBuckets[i];
-        if (hb.next.hasHashes() && !hb.next.isLive())
-        {
-            // Note: this `maxProtocolVersion` is over-approximate. The actual
-            // max for the ledger being published might be lower, but if the
-            // "true" (lower) max-value were actually in conflict with the state
-            // we're about to publish it should have caused an error earlier
-            // anyways, back when the bucket list and HAS for this state was
-            // initially formed. Since we're just reconstituting a HAS here, we
-            // assume it was legit when formed. Given that getting the true
-            // value here therefore doesn't seem to add much checking, and given
-            // that it'd be somewhat convoluted _to_ materialize the true value
-            // here, we're going to live with the approximate value for now.
-            uint32_t maxProtocolVersion =
-                Config::CURRENT_LEDGER_PROTOCOL_VERSION;
-            hb.next.makeLive(mApp, maxProtocolVersion,
-                             BucketList::keepDeadEntries(i));
-        }
+        throw std::runtime_error("Invalid HAS: malformed bucketlist");
     }
 }
 
@@ -88,7 +64,9 @@ StateSnapshot::writeHistoryBlocks() const
     uint32_t begin, count;
     size_t nHeaders;
     {
-        XDROutputFileStream ledgerOut, txOut, txResultOut, scpHistory;
+        bool doFsync = !mApp.getConfig().DISABLE_XDR_FSYNC;
+        XDROutputFileStream ledgerOut(doFsync), txOut(doFsync),
+            txResultOut(doFsync), scpHistory(doFsync);
         ledgerOut.open(mLedgerSnapFile->localPath_nogz());
         txOut.open(mTransactionSnapFile->localPath_nogz());
         txResultOut.open(mTransactionResultSnapFile->localPath_nogz());
@@ -152,5 +130,31 @@ StateSnapshot::writeHistoryBlocks() const
     }
 
     return true;
+}
+
+std::vector<std::shared_ptr<FileTransferInfo>>
+StateSnapshot::differingHASFiles(HistoryArchiveState const& other)
+{
+    std::vector<std::shared_ptr<FileTransferInfo>> files{};
+    auto addIfExists = [&](std::shared_ptr<FileTransferInfo> const& f) {
+        if (f && fs::exists(f->localPath_nogz()))
+        {
+            files.push_back(f);
+        }
+    };
+
+    addIfExists(mLedgerSnapFile);
+    addIfExists(mTransactionSnapFile);
+    addIfExists(mTransactionResultSnapFile);
+    addIfExists(mSCPHistorySnapFile);
+
+    for (auto const& hash : mLocalState.differingBuckets(other))
+    {
+        auto b = mApp.getBucketManager().getBucketByHash(hexToBin256(hash));
+        assert(b);
+        addIfExists(std::make_shared<FileTransferInfo>(*b));
+    }
+
+    return files;
 }
 }

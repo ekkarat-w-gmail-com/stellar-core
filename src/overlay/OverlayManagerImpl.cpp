@@ -5,10 +5,12 @@
 #include "overlay/OverlayManagerImpl.h"
 #include "crypto/KeyUtils.h"
 #include "crypto/SecretKey.h"
+#include "crypto/ShortHash.h"
 #include "database/Database.h"
 #include "main/Application.h"
 #include "main/Config.h"
 #include "main/ErrorMessages.h"
+#include "overlay/OverlayMetrics.h"
 #include "overlay/PeerBareAddress.h"
 #include "overlay/PeerManager.h"
 #include "overlay/RandomPeerSource.h"
@@ -16,6 +18,8 @@
 #include "util/Logging.h"
 #include "util/Math.h"
 #include "util/XDROperators.h"
+#include "util/format.h"
+#include "xdrpp/marshal.h"
 
 #include "medida/counter.h"
 #include "medida/meter.h"
@@ -102,6 +106,8 @@ OverlayManagerImpl::PeersList::byAddress(PeerBareAddress const& address) const
 void
 OverlayManagerImpl::PeersList::removePeer(Peer* peer)
 {
+    CLOG(TRACE, "Overlay") << "Removing peer " << peer->toString() << " @"
+                           << mOverlayManager.mApp.getConfig().PEER_PORT;
     assert(peer->getState() == Peer::CLOSING);
 
     auto pendingIt =
@@ -134,6 +140,10 @@ OverlayManagerImpl::PeersList::removePeer(Peer* peer)
 bool
 OverlayManagerImpl::PeersList::moveToAuthenticated(Peer::pointer peer)
 {
+    CLOG(TRACE, "Overlay") << "Moving peer " << peer->toString()
+                           << " to authenticated "
+                           << " state: " << peer->getState() << " @"
+                           << mOverlayManager.mApp.getConfig().PEER_PORT;
     auto pendingIt = std::find(std::begin(mPending), std::end(mPending), peer);
     if (pendingIt == std::end(mPending))
     {
@@ -167,6 +177,9 @@ OverlayManagerImpl::PeersList::moveToAuthenticated(Peer::pointer peer)
 bool
 OverlayManagerImpl::PeersList::acceptAuthenticatedPeer(Peer::pointer peer)
 {
+    CLOG(TRACE, "Overlay") << "Trying to promote peer to authenticated "
+                           << peer->toString() << " @"
+                           << mOverlayManager.mApp.getConfig().PEER_PORT;
     if (mOverlayManager.isPreferred(peer.get()))
     {
         if (mAuthenticated.size() < mMaxAuthenticatedCount)
@@ -202,6 +215,28 @@ OverlayManagerImpl::PeersList::acceptAuthenticatedPeer(Peer::pointer peer)
     CLOG(INFO, "Overlay")
         << "If you wish to allow for more " << mDirectionString
         << " connections, please update your configuration file";
+
+    if (Logging::logTrace("Overlay"))
+    {
+        CLOG(TRACE, "Overlay") << fmt::format(
+            "limit: {}, pending: {}, authenticated: {}", mMaxAuthenticatedCount,
+            mPending.size(), mAuthenticated.size());
+        std::stringstream pending, authenticated;
+        for (auto p : mPending)
+        {
+            pending << p->toString();
+            pending << " ";
+        }
+        for (auto p : mAuthenticated)
+        {
+            authenticated << p.second->toString();
+            authenticated << " ";
+        }
+        CLOG(TRACE, "Overlay")
+            << fmt::format("pending: [{}] authenticated: [{}]", pending.str(),
+                           authenticated.str());
+    }
+
     mConnectionsCancelled.Mark();
     return false;
 }
@@ -239,12 +274,10 @@ OverlayManagerImpl::OverlayManagerImpl(Application& app)
     , mDoor(mApp)
     , mAuth(mApp)
     , mShuttingDown(false)
-    , mMessagesBroadcast(app.getMetrics().NewMeter(
-          {"overlay", "message", "broadcast"}, "message"))
-    , mPendingPeersSize(
-          app.getMetrics().NewCounter({"overlay", "connection", "pending"}))
-    , mAuthenticatedPeersSize(app.getMetrics().NewCounter(
-          {"overlay", "connection", "authenticated"}))
+    , mOverlayMetrics(app)
+    , mMessageCache(0xffff)
+    , mCheckPerfLogLevelCounter(0)
+    , mPerfLogLevel(Logging::getLogLevel("Perf"))
     , mTimer(app)
     , mPeerIPTimer(app)
     , mFloodGate(app)
@@ -290,6 +323,8 @@ bool
 OverlayManagerImpl::connectToImpl(PeerBareAddress const& address,
                                   bool forceoutbound)
 {
+    CLOG(TRACE, "Overlay") << "Connect to " << address.toString() << " @"
+                           << mApp.getConfig().PEER_PORT;
     auto currentConnection = getConnectedPeer(address);
     if (!currentConnection || (forceoutbound && currentConnection->getRole() ==
                                                     Peer::REMOTE_CALLED_US))
@@ -462,7 +497,8 @@ OverlayManagerImpl::connectTo(std::vector<PeerBareAddress> const& peers,
 void
 OverlayManagerImpl::tick()
 {
-    CLOG(TRACE, "Overlay") << "OverlayManagerImpl tick";
+    CLOG(TRACE, "Overlay") << "OverlayManagerImpl tick  @"
+                           << mApp.getConfig().PEER_PORT;
 
     mLoad.maybeShedExcessLoad(mApp);
 
@@ -589,8 +625,9 @@ OverlayManagerImpl::ledgerClosed(uint32_t lastClosedledgerSeq)
 void
 OverlayManagerImpl::updateSizeCounters()
 {
-    mPendingPeersSize.set_count(getPendingPeersCount());
-    mAuthenticatedPeersSize.set_count(getAuthenticatedPeersCount());
+    mOverlayMetrics.mPendingPeersSize.set_count(getPendingPeersCount());
+    mOverlayMetrics.mAuthenticatedPeersSize.set_count(
+        getAuthenticatedPeersCount());
 }
 
 void
@@ -631,7 +668,8 @@ OverlayManagerImpl::addInboundConnection(Peer::pointer peer)
                    Peer::DropMode::IGNORE_WRITE_QUEUE);
         return;
     }
-    CLOG(DEBUG, "Overlay") << "New connected peer " << peer->toString();
+    CLOG(DEBUG, "Overlay") << "New connected peer " << peer->toString() << " @"
+                           << mApp.getConfig().PEER_PORT;
     mInboundPeers.mConnectionsEstablished.Mark();
     mInboundPeers.mPending.push_back(peer);
     updateSizeCounters();
@@ -659,7 +697,7 @@ OverlayManagerImpl::addOutboundConnection(Peer::pointer peer)
         {
             CLOG(DEBUG, "Overlay")
                 << "Peer rejected - all outbound connections taken: "
-                << peer->toString();
+                << peer->toString() << " @" << mApp.getConfig().PEER_PORT;
             CLOG(DEBUG, "Overlay") << "If you wish to allow for more pending "
                                       "outbound connections, please update "
                                       "your MAX_PENDING_CONNECTIONS setting in "
@@ -672,7 +710,8 @@ OverlayManagerImpl::addOutboundConnection(Peer::pointer peer)
                    Peer::DropMode::IGNORE_WRITE_QUEUE);
         return false;
     }
-    CLOG(DEBUG, "Overlay") << "New connected peer " << peer->toString();
+    CLOG(DEBUG, "Overlay") << "New connected peer " << peer->toString() << " @"
+                           << mApp.getConfig().PEER_PORT;
     mOutboundPeers.mConnectionsEstablished.Mark();
     mOutboundPeers.mPending.push_back(peer);
     updateSizeCounters();
@@ -767,7 +806,8 @@ OverlayManagerImpl::isPreferred(Peer* peer) const
     if (mConfigurationPreferredPeers.find(peer->getAddress()) !=
         mConfigurationPreferredPeers.end())
     {
-        CLOG(DEBUG, "Overlay") << "Peer " << pstr << " is preferred";
+        CLOG(DEBUG, "Overlay") << "Peer " << pstr << " is preferred  @"
+                               << mApp.getConfig().PEER_PORT;
         return true;
     }
 
@@ -779,13 +819,15 @@ OverlayManagerImpl::isPreferred(Peer* peer) const
         if (std::find(pk.begin(), pk.end(), kstr) != pk.end())
         {
             CLOG(DEBUG, "Overlay")
-                << "Peer key " << mApp.getConfig().toStrKey(peer->getPeerID())
-                << " is preferred";
+                << "Peer key "
+                << mApp.getConfig().toShortString(peer->getPeerID())
+                << " is preferred @" << mApp.getConfig().PEER_PORT;
             return true;
         }
     }
 
-    CLOG(DEBUG, "Overlay") << "Peer " << pstr << " is not preferred";
+    CLOG(DEBUG, "Overlay") << "Peer " << pstr << " is not preferred @"
+                           << mApp.getConfig().PEER_PORT;
     return false;
 }
 
@@ -816,7 +858,7 @@ OverlayManagerImpl::recvFloodedMsg(StellarMessage const& msg,
 void
 OverlayManagerImpl::broadcastMessage(StellarMessage const& msg, bool force)
 {
-    mMessagesBroadcast.Mark();
+    mOverlayMetrics.mMessagesBroadcast.Mark();
     mFloodGate.broadcast(msg, force);
 }
 
@@ -830,6 +872,12 @@ std::set<Peer::pointer>
 OverlayManagerImpl::getPeersKnows(Hash const& h)
 {
     return mFloodGate.getPeersKnows(h);
+}
+
+OverlayMetrics&
+OverlayManagerImpl::getOverlayMetrics()
+{
+    return mOverlayMetrics;
 }
 
 PeerAuth&
@@ -872,5 +920,69 @@ bool
 OverlayManagerImpl::isShuttingDown() const
 {
     return mShuttingDown;
+}
+
+static void
+logDuplicateMessage(el::Level level, size_t size, std::string const& dupOrUniq,
+                    std::string const& fetchOrFlood)
+{
+    if (level == el::Level::Trace)
+    {
+        CLOG(TRACE, "Perf") << "Received " << size << " " << dupOrUniq
+                            << " bytes of " << fetchOrFlood << " message";
+    }
+}
+
+void
+OverlayManagerImpl::recordDuplicateMessageMetric(
+    StellarMessage const& stellarMsg)
+{
+    bool flood = false;
+    if (stellarMsg.type() == TRANSACTION || stellarMsg.type() == SCP_MESSAGE)
+    {
+        flood = true;
+    }
+    else if (stellarMsg.type() != TX_SET && stellarMsg.type() != SCP_QUORUMSET)
+    {
+        return;
+    }
+
+    if (++mCheckPerfLogLevelCounter >= 100)
+    {
+        mCheckPerfLogLevelCounter = 0;
+        mPerfLogLevel = Logging::getLogLevel("Perf");
+    }
+
+    size_t size = xdr::xdr_argpack_size(stellarMsg);
+    auto hash = shortHash::xdrComputeHash(stellarMsg);
+    if (mMessageCache.exists(hash))
+    {
+        if (flood)
+        {
+            mOverlayMetrics.mDuplicateFloodBytesRecv.Mark(size);
+            logDuplicateMessage(mPerfLogLevel, size, "duplicate", "flood");
+        }
+        else
+        {
+            mOverlayMetrics.mDuplicateFetchBytesRecv.Mark(size);
+            logDuplicateMessage(mPerfLogLevel, size, "duplicate", "fetch");
+        }
+    }
+    else
+    {
+        // NOTE: false is used here as a placeholder value, since no value is
+        // needed.
+        mMessageCache.put(hash, false);
+        if (flood)
+        {
+            mOverlayMetrics.mUniqueFloodBytesRecv.Mark(size);
+            logDuplicateMessage(mPerfLogLevel, size, "unique", "flood");
+        }
+        else
+        {
+            mOverlayMetrics.mUniqueFetchBytesRecv.Mark(size);
+            logDuplicateMessage(mPerfLogLevel, size, "unique", "fetch");
+        }
+    }
 }
 }

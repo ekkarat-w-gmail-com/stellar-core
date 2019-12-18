@@ -39,6 +39,7 @@ PendingEnvelopes::PendingEnvelopes(Application& app, HerderImpl& herder)
     , mFetchingCount(
           app.getMetrics().NewCounter({"scp", "pending", "fetching"}))
     , mReadyCount(app.getMetrics().NewCounter({"scp", "pending", "ready"}))
+    , mFetchDuration(app.getMetrics().NewTimer({"scp", "fetch", "duration"}))
 {
 }
 
@@ -164,38 +165,7 @@ PendingEnvelopes::isNodeDefinitelyInQuorum(NodeID const& node)
 {
     if (mRebuildQuorum)
     {
-        // rebuild quorum information using data sources starting with the
-        // freshest source
-        mQuorumTracker.rebuild([&](NodeID const& id) -> SCPQuorumSetPtr {
-            SCPQuorumSetPtr res;
-            if (id == mHerder.getSCP().getLocalNodeID())
-            {
-                res = getQSet(
-                    mHerder.getSCP().getLocalNode()->getQuorumSetHash());
-            }
-            else
-            {
-                auto m = mHerder.getSCP().getLatestMessage(id);
-                if (m != nullptr)
-                {
-                    auto h = Slot::getCompanionQuorumSetHashFromStatement(
-                        m->statement);
-                    res = getQSet(h);
-                }
-                if (res == nullptr)
-                {
-                    // see if we had some information for that node
-                    auto& db = mApp.getDatabase();
-                    auto h = HerderPersistence::getNodeQuorumSet(
-                        db, db.getSession(), id);
-                    if (h)
-                    {
-                        res = getQSet(*h);
-                    }
-                }
-            }
-            return res;
-        });
+        rebuildQuorumTrackerState();
         mRebuildQuorum = false;
     }
     return mQuorumTracker.isNodeDefinitelyInQuorum(node);
@@ -232,7 +202,7 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
         auto& processedList =
             mEnvelopes[envelope.statement.slotIndex].mProcessedEnvelopes;
 
-        auto fetching = find(set.begin(), set.end(), envelope);
+        auto fetching = set.find(envelope);
 
         if (fetching == set.end())
         { // we aren't fetching this envelope
@@ -240,7 +210,9 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
                 processedList.end())
             { // we haven't seen this envelope before
                 // insert it into the fetching set
-                fetching = set.insert(envelope).first;
+                fetching =
+                    set.emplace(envelope, std::chrono::steady_clock::now())
+                        .first;
                 startFetch(envelope);
             }
             else
@@ -255,7 +227,16 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
         if (isFullyFetched(envelope))
         {
             // move the item from fetching to processed
-            processedList.emplace_back(*fetching);
+            processedList.emplace_back(fetching->first);
+            std::chrono::nanoseconds durationNano =
+                std::chrono::steady_clock::now() - fetching->second;
+            mFetchDuration.Update(durationNano);
+            CLOG(TRACE, "Perf")
+                << "Herder fetched for "
+                << hexAbbrev(sha256(xdr::xdr_to_opaque(envelope))) << " in "
+                << std::chrono::duration<double>(durationNano).count()
+                << " seconds";
+
             set.erase(fetching);
             envelopeReady(envelope);
             updateMetrics();
@@ -533,9 +514,9 @@ PendingEnvelopes::getJsonInfo(size_t limit)
             if (it->second.mFetchingEnvelopes.size() != 0)
             {
                 Json::Value& slot = ret[std::to_string(it->first)]["fetching"];
-                for (auto const& e : it->second.mFetchingEnvelopes)
+                for (auto const& kv : it->second.mFetchingEnvelopes)
                 {
-                    slot.append(mHerder.getSCP().envToStr(e));
+                    slot.append(mHerder.getSCP().envToStr(kv.first));
                 }
             }
             if (it->second.mReadyEnvelopes.size() != 0)
@@ -550,6 +531,42 @@ PendingEnvelopes::getJsonInfo(size_t limit)
         }
     }
     return ret;
+}
+
+void
+PendingEnvelopes::rebuildQuorumTrackerState()
+{
+    // rebuild quorum information using data sources starting with the
+    // freshest source
+    mQuorumTracker.rebuild([&](NodeID const& id) -> SCPQuorumSetPtr {
+        SCPQuorumSetPtr res;
+        if (id == mHerder.getSCP().getLocalNodeID())
+        {
+            res = getQSet(mHerder.getSCP().getLocalNode()->getQuorumSetHash());
+        }
+        else
+        {
+            auto m = mHerder.getSCP().getLatestMessage(id);
+            if (m != nullptr)
+            {
+                auto h =
+                    Slot::getCompanionQuorumSetHashFromStatement(m->statement);
+                res = getQSet(h);
+            }
+            if (res == nullptr)
+            {
+                // see if we had some information for that node
+                auto& db = mApp.getDatabase();
+                auto h = HerderPersistence::getNodeQuorumSet(
+                    db, db.getSession(), id);
+                if (h)
+                {
+                    res = getQSet(*h);
+                }
+            }
+        }
+        return res;
+    });
 }
 
 QuorumTracker::QuorumMap const&

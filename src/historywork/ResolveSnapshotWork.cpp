@@ -12,10 +12,14 @@ namespace stellar
 
 ResolveSnapshotWork::ResolveSnapshotWork(
     Application& app, std::shared_ptr<StateSnapshot> snapshot)
-    : BasicWork(app, "prepare-snapshot", Work::RETRY_NEVER)
+    : BasicWork(app, "prepare-snapshot", BasicWork::RETRY_NEVER)
     , mSnapshot(snapshot)
     , mTimer(std::make_unique<VirtualTimer>(app.getClock()))
 {
+    if (!mSnapshot)
+    {
+        throw std::runtime_error("ResolveSnapshotWork: invalid snapshot");
+    }
 }
 
 BasicWork::State
@@ -26,12 +30,13 @@ ResolveSnapshotWork::onRun()
         return State::WORK_FAILURE;
     }
 
+    mSnapshot->mLocalState.prepareForPublish(mApp);
     mSnapshot->mLocalState.resolveAnyReadyFutures();
-    mSnapshot->makeLive();
     if ((mApp.getLedgerManager().getLastClosedLedgerNum() >
          mSnapshot->mLocalState.currentLedger) &&
         mSnapshot->mLocalState.futuresAllResolved())
     {
+        assert(mSnapshot->mLocalState.containsValidBuckets(mApp));
         return State::WORK_SUCCESS;
     }
     else

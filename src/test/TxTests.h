@@ -89,10 +89,11 @@ bool doesAccountExist(Application& app, PublicKey const& k);
 xdr::xvector<Signer, 20> getAccountSigners(PublicKey const& k,
                                            Application& app);
 
-TransactionFramePtr
-transactionFromOperations(Application& app, SecretKey const& from,
-                          SequenceNumber seq,
-                          std::vector<Operation> const& ops);
+TransactionFramePtr transactionFromOperations(Application& app,
+                                              SecretKey const& from,
+                                              SequenceNumber seq,
+                                              std::vector<Operation> const& ops,
+                                              int fee = 0);
 
 Operation changeTrust(Asset const& asset, int64_t limit);
 
@@ -125,6 +126,11 @@ TransactionFramePtr createCreditPaymentTx(Application& app,
 Operation pathPayment(PublicKey const& to, Asset const& sendCur,
                       int64_t sendMax, Asset const& destCur, int64_t destAmount,
                       std::vector<Asset> const& path);
+
+Operation pathPaymentStrictSend(PublicKey const& to, Asset const& sendCur,
+                                int64_t sendAmount, Asset const& destCur,
+                                int64_t destMin,
+                                std::vector<Asset> const& path);
 
 Operation manageOffer(int64 offerId, Asset const& selling, Asset const& buying,
                       Price const& price, int64_t amount);

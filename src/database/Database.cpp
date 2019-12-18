@@ -55,7 +55,9 @@ using namespace std;
 
 bool Database::gDriversRegistered = false;
 
-static unsigned long const SCHEMA_VERSION = 10;
+// smallest schema version supported
+static unsigned long const MIN_SCHEMA_VERSION = 9;
+static unsigned long const SCHEMA_VERSION = 11;
 
 // These should always match our compiled version precisely, since we are
 // using a bundled version to get access to carray(). But in case someone
@@ -189,49 +191,17 @@ Database::applySchemaUpgrade(unsigned long vers)
     soci::transaction tx(mSession);
     switch (vers)
     {
-    case 7:
-        Upgrades::dropAll(*this);
-        mSession << "ALTER TABLE accounts ADD buyingliabilities BIGINT "
-                    "CHECK (buyingliabilities >= 0)";
-        mSession << "ALTER TABLE accounts ADD sellingliabilities BIGINT "
-                    "CHECK (sellingliabilities >= 0)";
-        mSession << "ALTER TABLE trustlines ADD buyingliabilities BIGINT "
-                    "CHECK (buyingliabilities >= 0)";
-        mSession << "ALTER TABLE trustlines ADD sellingliabilities BIGINT "
-                    "CHECK (sellingliabilities >= 0)";
-        break;
-
-    case 8:
-        mSession << "ALTER TABLE peers RENAME flags TO type";
-        mSession << "UPDATE peers SET type = 2*type";
-        break;
-    case 9:
-        // Update schema for signers
-        mSession << "ALTER TABLE accounts ADD signers TEXT";
-        mApp.getLedgerTxnRoot().writeSignersTableIntoAccountsTable();
-        mSession << "DROP TABLE IF EXISTS signers";
-
-        // Update schema for base-64 encoding
-        mApp.getLedgerTxnRoot().encodeDataNamesBase64();
-        mApp.getLedgerTxnRoot().encodeHomeDomainsBase64();
-
-        // Update schema for simplified offers table
-        mApp.getLedgerTxnRoot().writeOffersIntoSimplifiedOffersTable();
-        break;
     case 10:
         // add tracking table information
         mApp.getHerderPersistence().createQuorumTrackingTable(mSession);
         break;
+    case 11:
+        mSession << "DROP INDEX IF EXISTS bestofferindex;";
+        mSession << "CREATE INDEX bestofferindex ON offers "
+                    "(sellingasset,buyingasset,price,offerid);";
+        break;
     default:
-        if (vers <= 6)
-        {
-            throw std::runtime_error(
-                "Database version is too old, must use at least 7");
-        }
-        else
-        {
-            throw std::runtime_error("Unknown DB schema version");
-        }
+        throw std::runtime_error("Unknown DB schema version");
     }
     tx.commit();
 }
@@ -240,6 +210,14 @@ void
 Database::upgradeToCurrentSchema()
 {
     auto vers = getDBSchemaVersion();
+    if (vers < MIN_SCHEMA_VERSION)
+    {
+        std::string s = ("DB schema version " + std::to_string(vers) +
+                         " is older than minimum supported schema " +
+                         std::to_string(MIN_SCHEMA_VERSION));
+        throw std::runtime_error(s);
+    }
+
     if (vers > SCHEMA_VERSION)
     {
         std::string s = ("DB schema version " + std::to_string(vers) +
@@ -390,6 +368,7 @@ Database::initialize()
 
     // only time this section should be modified is when
     // consolidating changes found in applySchemaUpgrade here
+    Upgrades::dropAll(*this);
     mApp.getLedgerTxnRoot().dropAccounts();
     mApp.getLedgerTxnRoot().dropOffers();
     mApp.getLedgerTxnRoot().dropTrustLines();
@@ -399,11 +378,10 @@ Database::initialize()
     LedgerHeaderUtils::dropAll(*this);
     TransactionFrame::dropAll(*this);
     HistoryManager::dropAll(*this);
-    mApp.getBucketManager().dropAll();
     HerderPersistence::dropAll(*this);
     mApp.getLedgerTxnRoot().dropData();
     BanManager::dropAll(*this);
-    putSchemaVersion(6);
+    putSchemaVersion(MIN_SCHEMA_VERSION);
 
     LOG(INFO) << "* ";
     LOG(INFO) << "* The database has been initialized";
@@ -582,15 +560,19 @@ Database::recentIdleDbPercent()
 
 DBTimeExcluder::DBTimeExcluder(Application& app)
     : mApp(app)
-    , mStartQueryTime(app.getDatabase().totalQueryTime())
+    , mStartQueryTime(app.modeHasDatabase() ? app.getDatabase().totalQueryTime()
+                                            : std::chrono::nanoseconds(0))
     , mStartTotalTime(app.getClock().now())
 {
 }
 
 DBTimeExcluder::~DBTimeExcluder()
 {
-    auto deltaQ = mApp.getDatabase().totalQueryTime() - mStartQueryTime;
-    auto deltaT = mApp.getClock().now() - mStartTotalTime;
-    mApp.getDatabase().excludeTime(deltaQ, deltaT);
+    if (mApp.modeHasDatabase())
+    {
+        auto deltaQ = mApp.getDatabase().totalQueryTime() - mStartQueryTime;
+        auto deltaT = mApp.getClock().now() - mStartTotalTime;
+        mApp.getDatabase().excludeTime(deltaQ, deltaT);
+    }
 }
 }

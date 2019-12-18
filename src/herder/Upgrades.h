@@ -23,6 +23,10 @@ struct LedgerUpgrade;
 class Upgrades
 {
   public:
+    // # of hours after the scheduled upgrade time before we remove pending
+    // upgrades
+    static std::chrono::hours const UPDGRADE_EXPIRATION_HOURS;
+
     struct UpgradeParameters
     {
         UpgradeParameters()
@@ -67,6 +71,23 @@ class Upgrades
     // convert upgrade value to string
     static std::string toString(LedgerUpgrade const& upgrade);
 
+    enum class UpgradeValidity
+    {
+        VALID,
+        XDR_INVALID,
+        INVALID
+    };
+
+    // VALID if it is safe to apply upgrade
+    // XDR_INVALID if the upgrade cannot be deserialized
+    // INVALID if it is unsafe to apply the upgrade for any other reason
+    //
+    // If the upgrade could be deserialized then lupgrade is set
+    static UpgradeValidity isValidForApply(UpgradeType const& upgrade,
+                                           LedgerUpgrade& lupgrade,
+                                           LedgerHeader const& header,
+                                           uint32_t maxLedgerVersion);
+
     // returns true if upgrade is a valid upgrade step
     // in which case it also sets upgradeType
     bool isValid(UpgradeType const& upgrade, LedgerUpgradeType& upgradeType,
@@ -81,7 +102,7 @@ class Upgrades
     UpgradeParameters
     removeUpgrades(std::vector<UpgradeType>::const_iterator beginUpdates,
                    std::vector<UpgradeType>::const_iterator endUpdates,
-                   bool& updated);
+                   uint64_t time, bool& updated);
 
     static void dropAll(Database& db);
 
@@ -96,6 +117,11 @@ class Upgrades
     UpgradeParameters mParams;
 
     bool timeForUpgrade(uint64_t time) const;
+
+    // returns true if upgrade is a valid upgrade step
+    // in which case it also sets lupgrade
+    bool isValidForNomination(LedgerUpgrade const& upgrade,
+                              LedgerHeader const& header) const;
 
     static void applyVersionUpgrade(AbstractLedgerTxn& ltx,
                                     uint32_t newVersion);

@@ -401,6 +401,8 @@ PeerManager::ensureExists(PeerBareAddress const& address)
     auto peer = load(address);
     if (!peer.second)
     {
+        CLOG(TRACE, "Overlay") << "Learned peer " << address.toString() << " @"
+                               << mApp.getConfig().PEER_PORT;
         store(address, peer.first, peer.second);
     }
 }
@@ -517,7 +519,7 @@ const char* PeerManager::kSQLCreateStatement =
     "port          INT DEFAULT 0 CHECK (port > 0 AND port <= 65535) NOT NULL,"
     "nextattempt   TIMESTAMP NOT NULL,"
     "numfailures   INT DEFAULT 0 CHECK (numfailures >= 0) NOT NULL,"
-    "flags         INT NOT NULL,"
+    "type          INT NOT NULL,"
     "PRIMARY KEY (ip, port)"
     ");";
 }

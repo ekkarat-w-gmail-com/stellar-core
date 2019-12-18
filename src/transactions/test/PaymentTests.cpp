@@ -41,7 +41,7 @@ TEST_CASE("payment", "[tx][payment]")
 
     // Do our setup in version 1 so that for_all_versions below does not
     // try to downgrade us from >1 to 1.
-    cfg.LEDGER_PROTOCOL_VERSION = 1;
+    cfg.USE_CONFIG_FOR_GENESIS = false;
 
     VirtualClock clock;
     auto app = createTestApplication(clock, cfg);
@@ -57,10 +57,6 @@ TEST_CASE("payment", "[tx][payment]")
     // minimum balance necessary to hold 2 trust lines
     const int64_t minBalance2 =
         app->getLedgerManager().getLastMinBalance(2) + 10 * txfee;
-
-    // minimum balance necessary to hold 2 trust lines and an offer
-    const int64_t minBalance3 =
-        app->getLedgerManager().getLastMinBalance(3) + 10 * txfee;
 
     const int64_t paymentAmount = minBalance2;
 
@@ -977,12 +973,12 @@ TEST_CASE("payment", "[tx][payment]")
                         .code() == CREATE_ACCOUNT_SUCCESS);
             REQUIRE(tx->getResult().result.results()[1].code() == opINNER);
             REQUIRE(tx->getResult().result.results()[1].tr().type() ==
-                    PATH_PAYMENT);
+                    PATH_PAYMENT_STRICT_RECEIVE);
             REQUIRE(tx->getResult()
                         .result.results()[1]
                         .tr()
-                        .pathPaymentResult()
-                        .code() == PATH_PAYMENT_SUCCESS);
+                        .pathPaymentStrictReceiveResult()
+                        .code() == PATH_PAYMENT_STRICT_RECEIVE_SUCCESS);
             REQUIRE(tx->getResult().result.results()[2].code() == opINNER);
             REQUIRE(tx->getResult().result.results()[2].tr().type() ==
                     ACCOUNT_MERGE);

@@ -13,8 +13,12 @@
 #include "overlay/Floodgate.h"
 #include "overlay/ItemFetcher.h"
 #include "overlay/OverlayManager.h"
+#include "overlay/OverlayMetrics.h"
 #include "overlay/StellarXDR.h"
+#include "util/Logging.h"
 #include "util/Timer.h"
+
+#include "lib/util/lrucache.hpp"
 
 #include <future>
 #include <set>
@@ -76,9 +80,12 @@ class OverlayManagerImpl : public OverlayManager
     LoadManager mLoad;
     bool mShuttingDown;
 
-    medida::Meter& mMessagesBroadcast;
-    medida::Counter& mPendingPeersSize;
-    medida::Counter& mAuthenticatedPeersSize;
+    OverlayMetrics mOverlayMetrics;
+
+    // NOTE: bool is used here as a placeholder, since no ValueType is needed.
+    cache::lru_cache<uint64_t, bool> mMessageCache;
+    uint32_t mCheckPerfLogLevelCounter;
+    el::Level mPerfLogLevel;
 
     void tick();
     VirtualTimer mTimer;
@@ -124,6 +131,7 @@ class OverlayManagerImpl : public OverlayManager
 
     std::set<Peer::pointer> getPeersKnows(Hash const& h) override;
 
+    OverlayMetrics& getOverlayMetrics() override;
     PeerAuth& getPeerAuth() override;
 
     LoadManager& getLoadManager() override;
@@ -133,6 +141,9 @@ class OverlayManagerImpl : public OverlayManager
     void shutdown() override;
 
     bool isShuttingDown() const override;
+
+    void
+    recordDuplicateMessageMetric(StellarMessage const& stellarMsg) override;
 
   private:
     struct ResolvedPeers

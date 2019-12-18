@@ -53,6 +53,8 @@ struct LedgerUpgradeCheck
     std::vector<LedgerUpgradeableData> expected;
 };
 
+namespace
+{
 void
 simulateUpgrade(std::vector<LedgerUpgradeNode> const& nodes,
                 std::vector<LedgerUpgradeCheck> const& checks,
@@ -214,6 +216,26 @@ toUpgradeType(LedgerUpgrade const& upgrade)
     return result;
 }
 
+LedgerHeader
+executeUpgrades(Application& app, xdr::xvector<UpgradeType, 6> const& upgrades)
+{
+    auto& lm = app.getLedgerManager();
+    auto const& lcl = lm.getLastClosedLedgerHeader();
+    auto txSet = std::make_shared<TxSetFrame>(lcl.hash);
+
+    StellarValue sv{txSet->getContentsHash(), 2, upgrades, STELLAR_VALUE_BASIC};
+    LedgerCloseData ledgerData(lcl.header.ledgerSeq + 1, txSet, sv);
+
+    app.getLedgerManager().closeLedger(ledgerData);
+    return lm.getLastClosedLedgerHeader().header;
+};
+
+LedgerHeader
+executeUpgrade(Application& app, LedgerUpgrade const& lupgrade)
+{
+    return executeUpgrades(app, {toUpgradeType(lupgrade)});
+};
+
 void
 testListUpgrades(VirtualClock::time_point preferredUpgradeDatetime,
                  bool shouldListAny)
@@ -295,21 +317,6 @@ testListUpgrades(VirtualClock::time_point preferredUpgradeDatetime,
                 : std::vector<LedgerUpgrade>{};
         REQUIRE(upgrades == expected);
     }
-}
-
-TEST_CASE("list upgrades when no time set for upgrade", "[upgrades]")
-{
-    testListUpgrades({}, true);
-}
-
-TEST_CASE("list upgrades just before upgrade time", "[upgrades]")
-{
-    testListUpgrades(genesis(0, 1), false);
-}
-
-TEST_CASE("list upgrades at upgrade time", "[upgrades]")
-{
-    testListUpgrades(genesis(0, 0), true);
 }
 
 void
@@ -474,6 +481,22 @@ testValidateUpgrades(VirtualClock::time_point preferredUpgradeDatetime,
     checkWith(true);
     checkWith(false);
 }
+}
+
+TEST_CASE("list upgrades when no time set for upgrade", "[upgrades]")
+{
+    testListUpgrades({}, true);
+}
+
+TEST_CASE("list upgrades just before upgrade time", "[upgrades]")
+{
+    testListUpgrades(genesis(0, 1), false);
+}
+
+TEST_CASE("list upgrades at upgrade time", "[upgrades]")
+{
+    testListUpgrades(genesis(0, 0), true);
+}
 
 TEST_CASE("validate upgrades when no time set for upgrade", "[upgrades]")
 {
@@ -509,54 +532,39 @@ TEST_CASE("Ledger Manager applies upgrades properly", "[upgrades]")
     REQUIRE(lcl.header.baseReserve ==
             LedgerManager::GENESIS_LEDGER_BASE_RESERVE);
 
-    auto executeUpgrades = [&](xdr::xvector<UpgradeType, 6> const& upgrades) {
-        StellarValue sv{txSet->getContentsHash(), 2, upgrades,
-                        STELLAR_VALUE_BASIC};
-        LedgerCloseData ledgerData(lcl.header.ledgerSeq + 1, txSet, sv);
-        app->getLedgerManager().closeLedger(ledgerData);
-        return app->getLedgerManager().getLastClosedLedgerHeader();
-    };
-    auto executeUpgrade = [&](LedgerUpgrade const& upgrade) {
-        auto upgrades = xdr::xvector<UpgradeType, 6>{};
-        upgrades.push_back(toUpgradeType(upgrade));
-        return executeUpgrades(upgrades);
-    };
-
     SECTION("ledger version")
     {
-        REQUIRE(executeUpgrade(
-                    makeProtocolVersionUpgrade(cfg.LEDGER_PROTOCOL_VERSION))
-                    .header.ledgerVersion == cfg.LEDGER_PROTOCOL_VERSION);
+        REQUIRE(executeUpgrade(*app, makeProtocolVersionUpgrade(
+                                         cfg.LEDGER_PROTOCOL_VERSION))
+                    .ledgerVersion == cfg.LEDGER_PROTOCOL_VERSION);
     }
 
     SECTION("base fee")
     {
-        REQUIRE(executeUpgrade(makeBaseFeeUpgrade(1000)).header.baseFee ==
-                1000);
+        REQUIRE(executeUpgrade(*app, makeBaseFeeUpgrade(1000)).baseFee == 1000);
     }
 
     SECTION("max tx")
     {
-        REQUIRE(executeUpgrade(makeTxCountUpgrade(1300)).header.maxTxSetSize ==
+        REQUIRE(executeUpgrade(*app, makeTxCountUpgrade(1300)).maxTxSetSize ==
                 1300);
     }
 
     SECTION("base reserve")
     {
         REQUIRE(
-            executeUpgrade(makeBaseReserveUpgrade(1000)).header.baseReserve ==
+            executeUpgrade(*app, makeBaseReserveUpgrade(1000)).baseReserve ==
             1000);
     }
 
     SECTION("all")
     {
-        auto header =
-            executeUpgrades({toUpgradeType(makeProtocolVersionUpgrade(
-                                 cfg.LEDGER_PROTOCOL_VERSION)),
-                             toUpgradeType(makeBaseFeeUpgrade(1000)),
-                             toUpgradeType(makeTxCountUpgrade(1300)),
-                             toUpgradeType(makeBaseReserveUpgrade(1000))})
-                .header;
+        auto header = executeUpgrades(
+            *app, {toUpgradeType(
+                       makeProtocolVersionUpgrade(cfg.LEDGER_PROTOCOL_VERSION)),
+                   toUpgradeType(makeBaseFeeUpgrade(1000)),
+                   toUpgradeType(makeTxCountUpgrade(1300)),
+                   toUpgradeType(makeBaseReserveUpgrade(1000))});
         REQUIRE(header.ledgerVersion == cfg.LEDGER_PROTOCOL_VERSION);
         REQUIRE(header.baseFee == 1000);
         REQUIRE(header.maxTxSetSize == 1300);
@@ -568,9 +576,11 @@ TEST_CASE("upgrade to version 10", "[upgrades]")
 {
     VirtualClock clock;
     auto cfg = getTestConfig(0);
-    cfg.LEDGER_PROTOCOL_VERSION = 9;
+    cfg.USE_CONFIG_FOR_GENESIS = false;
+
     auto app = createTestApplication(clock, cfg);
     app->start();
+    executeUpgrade(*app, makeProtocolVersionUpgrade(9));
 
     auto& lm = app->getLedgerManager();
     auto txFee = lm.getLastTxFee();
@@ -587,16 +597,8 @@ TEST_CASE("upgrade to version 10", "[upgrades]")
     auto market = TestMarket{*app};
 
     auto executeUpgrade = [&] {
-        auto upgrades = xdr::xvector<UpgradeType, 6>{};
-        upgrades.push_back(toUpgradeType(makeProtocolVersionUpgrade(10)));
-
-        StellarValue sv{txSet->getContentsHash(), 2, upgrades,
-                        STELLAR_VALUE_BASIC};
-        LedgerCloseData ledgerData(lcl.header.ledgerSeq + 1, txSet, sv);
-        app->getLedgerManager().closeLedger(ledgerData);
-
-        auto const& lhhe = app->getLedgerManager().getLastClosedLedgerHeader();
-        REQUIRE(lhhe.header.ledgerVersion == 10);
+        REQUIRE(::executeUpgrade(*app, makeProtocolVersionUpgrade(10))
+                    .ledgerVersion == 10);
     };
 
     auto getLiabilities = [&](TestAccount& acc) {
@@ -1414,9 +1416,12 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
 {
     VirtualClock clock;
     auto cfg = getTestConfig(0);
-    cfg.LEDGER_PROTOCOL_VERSION = 10;
+    cfg.USE_CONFIG_FOR_GENESIS = false;
+
     auto app = createTestApplication(clock, cfg);
     app->start();
+    executeUpgrade(*app, makeProtocolVersionUpgrade(10));
+
     auto& lm = app->getLedgerManager();
     uint32_t newProto = 11;
     auto root = TestAccount{*app, txtest::getRoot(app->getNetworkID())};
@@ -1482,12 +1487,13 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
             // Check several subtle characteristics of the post-upgrade
             // environment:
             //   - Old-protocol merges stop happening (there should have
-            //     been 6 before the upgrade, and we stop there.)
+            //     been 6 before the upgrade, but we re-use a merge we did at
+            //     ledger 1 for ledger 2 spill, so the counter is at 5)
             //   - New-protocol merges start happening.
             //   - At the upgrade (5), we find 1 INITENTRY in lev[0].curr
             //   - The next two (6, 7), propagate INITENTRYs to lev[0].snap
             //   - From 8 on, the INITENTRYs propagate to lev[1].curr
-            REQUIRE(mc.mPreInitEntryProtocolMerges == 6);
+            REQUIRE(mc.mPreInitEntryProtocolMerges == 5);
             REQUIRE(mc.mPostInitEntryProtocolMerges != 0);
             auto& lev0 = bm.getBucketList().getLevel(0);
             auto& lev1 = bm.getBucketList().getLevel(1);
@@ -1519,6 +1525,110 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
     }
 }
 
+TEST_CASE("upgrade to version 12", "[upgrades]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.USE_CONFIG_FOR_GENESIS = false;
+
+    auto app = createTestApplication(clock, cfg);
+    app->start();
+    executeUpgrade(*app, makeProtocolVersionUpgrade(11));
+
+    auto& lm = app->getLedgerManager();
+    uint32_t oldProto = 11;
+    uint32_t newProto = 12;
+    auto root = TestAccount{*app, txtest::getRoot(app->getNetworkID())};
+
+    for (size_t i = 0; i < 10; ++i)
+    {
+        auto stranger =
+            TestAccount{*app, txtest::getAccount(fmt::format("stranger{}", i))};
+        TxSetFramePtr txSet =
+            std::make_shared<TxSetFrame>(lm.getLastClosedLedgerHeader().hash);
+        uint32_t ledgerSeq = lm.getLastClosedLedgerNum() + 1;
+        uint64_t minBalance = lm.getLastMinBalance(5);
+        uint64_t big = minBalance + ledgerSeq;
+        uint64_t closeTime = 60 * 5 * ledgerSeq;
+        txSet->add(root.tx({txtest::createAccount(stranger, big)}));
+        // Provoke sortForHash and hash-caching:
+        txSet->getContentsHash();
+
+        // On 4th iteration of advance (a.k.a. ledgerSeq 5), perform a
+        // ledger-protocol version upgrade to the new protocol, to
+        // start new-style merges (no shadows)
+        auto upgrades = xdr::xvector<UpgradeType, 6>{};
+        if (ledgerSeq == 5)
+        {
+            auto ledgerUpgrade = LedgerUpgrade{LEDGER_UPGRADE_VERSION};
+            ledgerUpgrade.newLedgerVersion() = newProto;
+            auto v = xdr::xdr_to_opaque(ledgerUpgrade);
+            upgrades.push_back(UpgradeType{v.begin(), v.end()});
+            CLOG(INFO, "Ledger")
+                << "Ledger " << ledgerSeq << " upgrading to v" << newProto;
+        }
+        StellarValue sv(txSet->getContentsHash(), closeTime, upgrades,
+                        STELLAR_VALUE_BASIC);
+        lm.closeLedger(LedgerCloseData(ledgerSeq, txSet, sv));
+        auto& bm = app->getBucketManager();
+        auto mc = bm.readMergeCounters();
+        auto& bl = bm.getBucketList();
+        while (!bl.futuresAllResolved())
+        {
+            bl.resolveAnyReadyFutures();
+        }
+
+        if (ledgerSeq < 5)
+        {
+            REQUIRE(mc.mPreShadowRemovalProtocolMerges != 0);
+        }
+        else
+        {
+            auto& lev0 = bm.getBucketList().getLevel(0);
+            auto& lev1 = bm.getBucketList().getLevel(1);
+            auto lev0Curr = lev0.getCurr();
+            auto lev0Snap = lev0.getSnap();
+            auto lev1Curr = lev1.getCurr();
+            auto lev1Snap = lev1.getSnap();
+            auto getVers = [](std::shared_ptr<Bucket> b) -> uint32_t {
+                return BucketInputIterator(b).getMetadata().ledgerVersion;
+            };
+            switch (ledgerSeq)
+            {
+            case 8:
+                REQUIRE(getVers(lev1Curr) == newProto);
+                REQUIRE(getVers(lev1Snap) == oldProto);
+                REQUIRE(mc.mPostShadowRemovalProtocolMerges == 6);
+                // One more old-style merge despite the upgrade
+                // At ledger 8, level 2 spills, and starts an old-style merge,
+                // as level 1 snap is still of old version
+                REQUIRE(mc.mPreShadowRemovalProtocolMerges == 6);
+                break;
+            case 7:
+                REQUIRE(getVers(lev0Snap) == newProto);
+                REQUIRE(getVers(lev1Curr) == oldProto);
+                REQUIRE(mc.mPostShadowRemovalProtocolMerges == 4);
+                REQUIRE(mc.mPreShadowRemovalProtocolMerges == 5);
+                break;
+            case 6:
+                REQUIRE(getVers(lev0Snap) == newProto);
+                REQUIRE(getVers(lev1Curr) == oldProto);
+                REQUIRE(mc.mPostShadowRemovalProtocolMerges == 3);
+                REQUIRE(mc.mPreShadowRemovalProtocolMerges == 5);
+                break;
+            case 5:
+                REQUIRE(getVers(lev0Curr) == newProto);
+                REQUIRE(getVers(lev0Snap) == oldProto);
+                REQUIRE(mc.mPostShadowRemovalProtocolMerges == 1);
+                REQUIRE(mc.mPreShadowRemovalProtocolMerges == 5);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+}
+
 TEST_CASE("upgrade base reserve", "[upgrades]")
 {
     VirtualClock clock;
@@ -1526,7 +1636,7 @@ TEST_CASE("upgrade base reserve", "[upgrades]")
 
     // Do our setup in version 1 so that for_versions_* below do not
     // try to downgrade us from >1 to 1.
-    cfg.LEDGER_PROTOCOL_VERSION = 1;
+    cfg.USE_CONFIG_FOR_GENESIS = false;
 
     auto app = createTestApplication(clock, cfg);
     app->start();
@@ -1546,16 +1656,8 @@ TEST_CASE("upgrade base reserve", "[upgrades]")
     auto market = TestMarket{*app};
 
     auto executeUpgrade = [&](uint32_t newReserve) {
-        auto upgrades = xdr::xvector<UpgradeType, 6>{};
-        upgrades.push_back(toUpgradeType(makeBaseReserveUpgrade(newReserve)));
-
-        StellarValue sv{txSet->getContentsHash(), 2, upgrades,
-                        STELLAR_VALUE_BASIC};
-        LedgerCloseData ledgerData(lcl.header.ledgerSeq + 1, txSet, sv);
-        app->getLedgerManager().closeLedger(ledgerData);
-
-        auto const& lhhe = app->getLedgerManager().getLastClosedLedgerHeader();
-        REQUIRE(lhhe.header.baseReserve == newReserve);
+        REQUIRE(::executeUpgrade(*app, makeBaseReserveUpgrade(newReserve))
+                    .baseReserve == newReserve);
     };
 
     auto getLiabilities = [&](TestAccount& acc) {
@@ -1723,7 +1825,7 @@ TEST_CASE("upgrade base reserve", "[upgrades]")
     }
 }
 
-TEST_CASE("simulate upgrades", "[herder][upgrades]")
+TEST_CASE("simulate upgrades", "[herder][upgrades][acceptance]")
 {
     // no upgrade is done
     auto noUpgrade =
@@ -1810,5 +1912,80 @@ TEST_CASE("simulate upgrades", "[herder][upgrades]")
             {genesis(0, 9), {noUpgrade, noUpgrade, noUpgrade}},
             {genesis(0, 20), {upgrade, upgrade, upgrade}}};
         simulateUpgrade(nodes, checks);
+    }
+}
+
+TEST_CASE("upgrade invalid during ledger close", "[upgrades]")
+{
+    VirtualClock clock;
+    auto app = createTestApplication(clock, getTestConfig());
+    app->start();
+
+    // Version upgrade to unsupported
+    REQUIRE_THROWS(
+        executeUpgrade(*app, makeProtocolVersionUpgrade(
+                                 Config::CURRENT_LEDGER_PROTOCOL_VERSION + 1)));
+
+    // Version downgrade
+    REQUIRE_THROWS(
+        executeUpgrade(*app, makeProtocolVersionUpgrade(
+                                 Config::CURRENT_LEDGER_PROTOCOL_VERSION - 1)));
+
+    // Base Fee / TxSet size / Base Reserve to 0
+    REQUIRE_THROWS(executeUpgrade(*app, makeBaseFeeUpgrade(0)));
+    REQUIRE_THROWS(executeUpgrade(*app, makeTxCountUpgrade(0)));
+    REQUIRE_THROWS(executeUpgrade(*app, makeBaseReserveUpgrade(0)));
+}
+
+TEST_CASE("validate upgrade expiration logic", "[upgrades]")
+{
+    auto cfg = getTestConfig();
+    cfg.LEDGER_PROTOCOL_VERSION = 10;
+    cfg.TESTING_UPGRADE_DESIRED_FEE = 100;
+    cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 50;
+    cfg.TESTING_UPGRADE_RESERVE = 100000000;
+    cfg.TESTING_UPGRADE_DATETIME = genesis(0, 0);
+
+    auto header = LedgerHeader{};
+
+    // make sure the network info is different than what's armed
+    header.ledgerVersion = cfg.LEDGER_PROTOCOL_VERSION - 1;
+    header.baseFee = cfg.TESTING_UPGRADE_DESIRED_FEE - 1;
+    header.baseReserve = cfg.TESTING_UPGRADE_RESERVE - 1;
+    header.maxTxSetSize = cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE - 1;
+
+    SECTION("remove expired upgrades")
+    {
+        header.scpValue.closeTime = VirtualClock::to_time_t(
+            cfg.TESTING_UPGRADE_DATETIME + Upgrades::UPDGRADE_EXPIRATION_HOURS);
+
+        bool updated = false;
+        auto upgrades = Upgrades{cfg}.removeUpgrades(
+            header.scpValue.upgrades.begin(), header.scpValue.upgrades.end(),
+            header.scpValue.closeTime, updated);
+
+        REQUIRE(updated);
+        REQUIRE(!upgrades.mProtocolVersion);
+        REQUIRE(!upgrades.mBaseFee);
+        REQUIRE(!upgrades.mMaxTxSize);
+        REQUIRE(!upgrades.mBaseReserve);
+    }
+
+    SECTION("upgrades not yet expired")
+    {
+        header.scpValue.closeTime = VirtualClock::to_time_t(
+            cfg.TESTING_UPGRADE_DATETIME + Upgrades::UPDGRADE_EXPIRATION_HOURS -
+            std::chrono::seconds(1));
+
+        bool updated = false;
+        auto upgrades = Upgrades{cfg}.removeUpgrades(
+            header.scpValue.upgrades.begin(), header.scpValue.upgrades.end(),
+            header.scpValue.closeTime, updated);
+
+        REQUIRE(!updated);
+        REQUIRE(upgrades.mProtocolVersion);
+        REQUIRE(upgrades.mBaseFee);
+        REQUIRE(upgrades.mMaxTxSize);
+        REQUIRE(upgrades.mBaseReserve);
     }
 }

@@ -15,15 +15,19 @@
 #include "bucket/BucketManager.h"
 #include "bucket/BucketManagerImpl.h"
 #include "bucket/BucketTests.h"
+#include "history/HistoryArchiveManager.h"
 #include "ledger/LedgerTxn.h"
 #include "ledger/test/LedgerTestUtils.h"
 #include "lib/catch.hpp"
 #include "main/Application.h"
 #include "main/Config.h"
+#include "main/ExternalQueue.h"
 #include "test/TestUtils.h"
 #include "test/test.h"
 #include "util/Math.h"
 #include "util/Timer.h"
+
+#include <cstdio>
 
 using namespace stellar;
 using namespace BucketTests;
@@ -81,10 +85,11 @@ class LedgerManagerForBucketTests : public LedgerManagerImpl
     }
 };
 
-class LedgerManagerTestApplication : public TestApplication
+class BucketManagerTestApplication : public TestApplication
 {
   public:
-    LedgerManagerTestApplication(VirtualClock& clock, Config const& cfg)
+    BucketManagerTestApplication(VirtualClock& clock, Config const& cfg,
+                                 Application::AppMode mode)
         : TestApplication(clock, cfg)
     {
     }
@@ -143,6 +148,9 @@ clearFutures(Application::pointer app, BucketList& bl)
         std::unique_lock<std::mutex> lock(mutex);
         cv2.wait(lock, [&] { return finished == n; });
     }
+
+    // Tell the BucketManager to forget all about the futures it knows.
+    app->getBucketManager().clearMergeFuturesForTesting();
 }
 
 static Hash
@@ -276,20 +284,20 @@ TEST_CASE("bucketmanager ownership", "[bucket][bucketmanager]")
         std::shared_ptr<Bucket> b1;
 
         {
-            std::shared_ptr<Bucket> b2 =
-                Bucket::fresh(app->getBucketManager(), getAppLedgerVersion(app),
-                              {}, live, dead, /*countMergeEvents=*/true);
+            std::shared_ptr<Bucket> b2 = Bucket::fresh(
+                app->getBucketManager(), getAppLedgerVersion(app), {}, live,
+                dead, /*countMergeEvents=*/true, /*doFsync=*/true);
             b1 = b2;
 
             // Bucket is referenced by b1, b2 and the BucketManager.
             CHECK(b1.use_count() == 3);
 
-            std::shared_ptr<Bucket> b3 =
-                Bucket::fresh(app->getBucketManager(), getAppLedgerVersion(app),
-                              {}, live, dead, /*countMergeEvents=*/true);
-            std::shared_ptr<Bucket> b4 =
-                Bucket::fresh(app->getBucketManager(), getAppLedgerVersion(app),
-                              {}, live, dead, /*countMergeEvents=*/true);
+            std::shared_ptr<Bucket> b3 = Bucket::fresh(
+                app->getBucketManager(), getAppLedgerVersion(app), {}, live,
+                dead, /*countMergeEvents=*/true, /*doFsync=*/true);
+            std::shared_ptr<Bucket> b4 = Bucket::fresh(
+                app->getBucketManager(), getAppLedgerVersion(app), {}, live,
+                dead, /*countMergeEvents=*/true, /*doFsync=*/true);
             // Bucket is referenced by b1, b2, b3, b4 and the BucketManager.
             CHECK(b1.use_count() == 5);
         }
@@ -331,6 +339,320 @@ TEST_CASE("bucketmanager ownership", "[bucket][bucketmanager]")
         b1.reset();
         app->getBucketManager().forgetUnreferencedBuckets();
         CHECK(!fs::exists(filename));
+    });
+}
+
+TEST_CASE("bucketmanager missing buckets fail", "[bucket][bucketmanager]")
+{
+    Config cfg(getTestConfig(0, Config::TESTDB_ON_DISK_SQLITE));
+    std::string someBucketFileName;
+    {
+        VirtualClock clock;
+        auto app =
+            createTestApplication<BucketManagerTestApplication>(clock, cfg);
+        app->start();
+        BucketManager& bm = app->getBucketManager();
+        BucketList& bl = bm.getBucketList();
+        LedgerManagerForBucketTests& lm = app->getLedgerManager();
+
+        uint32_t ledger = 0;
+        uint32_t level = 3;
+        do
+        {
+            ++ledger;
+            lm.setNextLedgerEntryBatchForBucketTesting(
+                {}, LedgerTestUtils::generateValidLedgerEntries(10), {});
+            closeLedger(*app);
+        } while (!BucketList::levelShouldSpill(ledger, level - 1));
+        auto someBucket = bl.getLevel(1).getCurr();
+        someBucketFileName = someBucket->getFilename();
+    }
+
+    // Delete a bucket from the bucket dir
+    REQUIRE(std::remove(someBucketFileName.c_str()) == 0);
+
+    // Check that restarting the app crashes.
+    {
+        VirtualClock clock;
+        Application::pointer app =
+            createTestApplication(clock, cfg, /*newDB=*/false);
+        CHECK_THROWS_AS(app->start(), std::runtime_error);
+    }
+}
+
+TEST_CASE("bucketmanager reattach to finished merge", "[bucket][bucketmanager]")
+{
+    VirtualClock clock;
+    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+    cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
+
+    for_versions_with_differing_bucket_logic(cfg, [&](Config const& cfg) {
+        Application::pointer app = createTestApplication(clock, cfg);
+
+        BucketManager& bm = app->getBucketManager();
+        BucketList& bl = bm.getBucketList();
+        auto vers = getAppLedgerVersion(app);
+
+        // Add some entries to get to a nontrivial merge-state.
+        uint32_t ledger = 0;
+        uint32_t level = 3;
+        do
+        {
+            ++ledger;
+            bl.addBatch(*app, ledger, vers, {},
+                        LedgerTestUtils::generateValidLedgerEntries(10), {});
+            bm.forgetUnreferencedBuckets();
+        } while (!BucketList::levelShouldSpill(ledger, level - 1));
+
+        // Check that the merge on level isn't committed (we're in
+        // ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING mode that does not resolve
+        // eagerly)
+        REQUIRE(bl.getLevel(level).getNext().isMerging());
+
+        // Serialize HAS.
+        HistoryArchiveState has(ledger, bl);
+        std::string serialHas = has.toString();
+
+        // Simulate level committing (and the FutureBucket clearing),
+        // followed by the typical ledger-close bucket GC event.
+        bl.getLevel(level).commit();
+        REQUIRE(!bl.getLevel(level).getNext().isMerging());
+        auto ra = bm.readMergeCounters().mFinishedMergeReattachments;
+        REQUIRE(ra == 0);
+
+        // Deserialize HAS.
+        HistoryArchiveState has2;
+        has2.fromString(serialHas);
+
+        // Reattach to _finished_ merge future on level.
+        has2.currentBuckets[level].next.makeLive(
+            *app, vers, BucketList::keepDeadEntries(level));
+        REQUIRE(has2.currentBuckets[level].next.isMerging());
+
+        // Resolve reattached future.
+        has2.currentBuckets[level].next.resolve();
+
+        // Check that we reattached to a finished merge.
+        ra = bm.readMergeCounters().mFinishedMergeReattachments;
+        REQUIRE(ra != 0);
+    });
+}
+
+TEST_CASE("bucketmanager reattach to running merge", "[bucket][bucketmanager]")
+{
+    VirtualClock clock;
+    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+    cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
+
+    for_versions_with_differing_bucket_logic(cfg, [&](Config const& cfg) {
+        Application::pointer app = createTestApplication(clock, cfg);
+
+        BucketManager& bm = app->getBucketManager();
+        BucketList& bl = bm.getBucketList();
+        auto vers = getAppLedgerVersion(app);
+
+        // This test is a race that will (if all goes well) eventually be won:
+        // we keep trying to do an immediate-reattach to a running merge and
+        // will only lose in cases of extremely short-running merges that finish
+        // before we have a chance to reattach. Once the merges are at all
+        // nontrivial in size, we'll likely win. In practice we observe the race
+        // being won within 10 ledgers.
+        //
+        // The amount of testing machinery we have to put in place to make this
+        // a non-racy test seems to be (a) extensive and (b) not worth the
+        // trouble, since it'd be testing fake circumstances anyways: the entire
+        // point of reattachment is to provide a benefit in cases where this
+        // race is won. So testing it _as_ a race seems reasonably fair.
+        //
+        // That said, nondeterminism in tests is no fun and tests that run
+        // potentially-forever are no fun. So we put a statistically-unlikely
+        // limit in here of 10,000 merges. If we consistently lose for that
+        // long, there's probably something wrong with the code, and in any case
+        // it's a better nondeterministic failure than timing out the entire
+        // testsuite with no explanation.
+        uint32_t ledger = 0;
+        uint32_t limit = 10000;
+        while (ledger < limit &&
+               bm.readMergeCounters().mRunningMergeReattachments == 0)
+        {
+            ++ledger;
+            // Merges will start on one or more levels here, starting a race
+            // between the main thread here and the background workers doing
+            // the merges.
+            bl.addBatch(*app, ledger, vers, {},
+                        LedgerTestUtils::generateValidLedgerEntries(100), {});
+
+            bm.forgetUnreferencedBuckets();
+
+            HistoryArchiveState has(ledger, bl);
+            std::string serialHas = has.toString();
+
+            // Deserialize and reactivate levels of HAS. Races with the merge
+            // workers end here. One of these reactivations should eventually
+            // reattach, winning the race (each time around this loop the
+            // merge workers will take longer to finish, so we will likely
+            // win quite shortly).
+            HistoryArchiveState has2;
+            has2.fromString(serialHas);
+            for (uint32_t level = 0; level < BucketList::kNumLevels; ++level)
+            {
+                if (has2.currentBuckets[level].next.hasHashes())
+                {
+                    has2.currentBuckets[level].next.makeLive(
+                        *app, vers, BucketList::keepDeadEntries(level));
+                }
+            }
+        }
+        CLOG(INFO, "Bucket")
+            << "reattached to running merge at or around ledger " << ledger;
+        REQUIRE(ledger < limit);
+        auto ra = bm.readMergeCounters().mFinishedMergeReattachments;
+        REQUIRE(ra != 0);
+    });
+}
+
+TEST_CASE("bucketmanager don't leak empty-merge futures",
+          "[bucket][bucketmanager]")
+{
+    // The point of this test is to confirm that
+    // BucketManager::noteEmptyMergeOutput is being called properly from merges
+    // that produce empty outputs, and that the input buckets to those merges
+    // are thereby not leaking.
+    VirtualClock clock;
+    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+    cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
+    cfg.LEDGER_PROTOCOL_VERSION =
+        Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY - 1;
+
+    auto app = createTestApplication<BucketManagerTestApplication>(clock, cfg);
+    app->start();
+
+    BucketManager& bm = app->getBucketManager();
+    BucketList& bl = bm.getBucketList();
+    LedgerManagerForBucketTests& lm = app->getLedgerManager();
+
+    // We create 8 live ledger entries spread across 8 ledgers then add a ledger
+    // that destroys all 8, which then serves to shadow-out the entries when
+    // subsequent merges touch them, producing empty buckets.
+    for (size_t i = 0; i < 128; ++i)
+    {
+        auto entries = LedgerTestUtils::generateValidLedgerEntries(8);
+        REQUIRE(entries.size() == 8);
+        for (auto const& e : entries)
+        {
+            lm.setNextLedgerEntryBatchForBucketTesting({}, {e}, {});
+            closeLedger(*app);
+        }
+        std::vector<LedgerKey> dead;
+        for (auto const& e : entries)
+        {
+            dead.emplace_back(LedgerEntryKey(e));
+        }
+        lm.setNextLedgerEntryBatchForBucketTesting({}, {}, dead);
+        closeLedger(*app);
+    }
+
+    // Now check that the bucket dir has only as many buckets as
+    // we expect given the nonzero entries in the bucketlist.
+    while (!bl.futuresAllResolved())
+    {
+        bl.resolveAnyReadyFutures();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    bm.forgetUnreferencedBuckets();
+    auto bmRefBuckets = bm.getReferencedBuckets();
+    auto bmDirBuckets = bm.getBucketHashesInBucketDirForTesting();
+
+    // Remove the 0 bucket in case it's "referenced"; it's never a file.
+    bmRefBuckets.erase(Hash());
+
+    for (auto const& bmr : bmRefBuckets)
+    {
+        CLOG(DEBUG, "Bucket") << "bucketmanager ref: " << bmr;
+    }
+    for (auto const& bmd : bmDirBuckets)
+    {
+        CLOG(DEBUG, "Bucket") << "bucketmanager dir: " << bmd;
+    }
+    REQUIRE(bmRefBuckets.size() == bmDirBuckets.size());
+}
+
+TEST_CASE("bucketmanager reattach HAS from publish queue to finished merge",
+          "[bucket][bucketmanager]")
+{
+    Config cfg(getTestConfig());
+    cfg.MAX_CONCURRENT_SUBPROCESSES = 1;
+    cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+    cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
+    stellar::historytestutils::TmpDirHistoryConfigurator tcfg;
+    cfg = tcfg.configure(cfg, true);
+
+    for_versions_with_differing_bucket_logic(cfg, [&](Config const& cfg) {
+        VirtualClock clock;
+        Application::pointer app = createTestApplication(clock, cfg);
+        auto vers = getAppLedgerVersion(app);
+        auto& hm = app->getHistoryManager();
+        auto& bm = app->getBucketManager();
+        auto& bl = bm.getBucketList();
+        auto& lm = app->getLedgerManager();
+        hm.setPublicationEnabled(false);
+        app->start();
+        app->getHistoryArchiveManager().initializeHistoryArchive(
+            tcfg.getArchiveDirName());
+        while (hm.getPublishQueueCount() < 5)
+        {
+            // Do not merge this line with the next line: CLOG and
+            // readMergeCounters each acquire a mutex, and it's possible to
+            // deadlock with one of the worker threads if you try to hold them
+            // both at the same time.
+            auto ra = bm.readMergeCounters().mFinishedMergeReattachments;
+            CLOG(INFO, "Bucket")
+                << "finished-merge reattachments while queueing: " << ra;
+            bl.addBatch(*app, lm.getLastClosedLedgerNum() + 1, vers, {},
+                        LedgerTestUtils::generateValidLedgerEntries(100), {});
+            clock.crank(false);
+            bm.forgetUnreferencedBuckets();
+        }
+        // We should have published nothing and have the first
+        // checkpoint still queued.
+        REQUIRE(hm.getPublishSuccessCount() == 0);
+        REQUIRE(hm.getMinLedgerQueuedToPublish() == 7);
+
+        auto oldReattachments =
+            bm.readMergeCounters().mFinishedMergeReattachments;
+        auto HASs = hm.getPublishQueueStates();
+        REQUIRE(HASs.size() == 5);
+        for (auto& has : HASs)
+        {
+            has.prepareForPublish(*app);
+        }
+
+        auto ra = bm.readMergeCounters().mFinishedMergeReattachments;
+        if (vers < Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
+        {
+            // Versions prior to FIRST_PROTOCOL_SHADOWS_REMOVED re-attach to
+            // finished merges
+            REQUIRE(ra > oldReattachments);
+            CLOG(INFO, "Bucket")
+                << "finished-merge reattachments after making-live: " << ra;
+        }
+        else
+        {
+            // Versions after FIRST_PROTOCOL_SHADOWS_REMOVED do not re-attach,
+            // because merges are cleared
+            REQUIRE(ra == oldReattachments);
+        }
+
+        // Un-cork the publication process, nothing should be broken.
+        hm.setPublicationEnabled(true);
+        while (hm.getPublishSuccessCount() < 5)
+        {
+            clock.crank(false);
+
+            // Trim history after publishing whenever possible.
+            ExternalQueue ps(*app);
+            ps.deleteOldEntries(50000);
+        }
     });
 }
 
@@ -400,6 +722,16 @@ class StopAndRestartBucketMergesTest
             CLOG(INFO, "Bucket") << "PostInitEntryProtocolMerges: "
                                  << mMergeCounters.mPostInitEntryProtocolMerges;
             CLOG(INFO, "Bucket")
+                << "mPreShadowRemovalProtocolMerges: "
+                << mMergeCounters.mPreShadowRemovalProtocolMerges;
+            CLOG(INFO, "Bucket")
+                << "mPostShadowRemovalProtocolMerges: "
+                << mMergeCounters.mPostShadowRemovalProtocolMerges;
+            CLOG(INFO, "Bucket") << "RunningMergeReattachments: "
+                                 << mMergeCounters.mRunningMergeReattachments;
+            CLOG(INFO, "Bucket") << "FinishedMergeReattachments: "
+                                 << mMergeCounters.mFinishedMergeReattachments;
+            CLOG(INFO, "Bucket")
                 << "NewMetaEntries: " << mMergeCounters.mNewMetaEntries;
             CLOG(INFO, "Bucket")
                 << "NewInitEntries: " << mMergeCounters.mNewInitEntries;
@@ -451,9 +783,17 @@ class StopAndRestartBucketMergesTest
         }
 
         void
-        checkSensiblePostInitEntryMergeCounters() const
+        checkSensiblePostInitEntryMergeCounters(uint32_t protocol) const
         {
             CHECK(mMergeCounters.mPostInitEntryProtocolMerges != 0);
+            if (protocol < Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
+            {
+                CHECK(mMergeCounters.mPostShadowRemovalProtocolMerges == 0);
+            }
+            else
+            {
+                CHECK(mMergeCounters.mPostShadowRemovalProtocolMerges != 0);
+            }
 
             CHECK(mMergeCounters.mNewMetaEntries == 0);
             CHECK(mMergeCounters.mNewInitEntries != 0);
@@ -472,9 +812,18 @@ class StopAndRestartBucketMergesTest
             CHECK(mMergeCounters.mOldInitEntriesMergedWithNewDead != 0);
             CHECK(mMergeCounters.mNewEntriesMergedWithOldNeitherInit != 0);
 
-            CHECK(mMergeCounters.mShadowScanSteps != 0);
+            if (protocol < Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
+            {
+                CHECK(mMergeCounters.mShadowScanSteps != 0);
+                CHECK(mMergeCounters.mLiveEntryShadowElisions != 0);
+            }
+            else
+            {
+                CHECK(mMergeCounters.mShadowScanSteps == 0);
+                CHECK(mMergeCounters.mLiveEntryShadowElisions == 0);
+            }
+
             CHECK(mMergeCounters.mMetaEntryShadowElisions == 0);
-            CHECK(mMergeCounters.mLiveEntryShadowElisions != 0);
             CHECK(mMergeCounters.mInitEntryShadowElisions == 0);
             CHECK(mMergeCounters.mDeadEntryShadowElisions == 0);
 
@@ -488,6 +837,7 @@ class StopAndRestartBucketMergesTest
         checkSensiblePreInitEntryMergeCounters() const
         {
             CHECK(mMergeCounters.mPreInitEntryProtocolMerges != 0);
+            CHECK(mMergeCounters.mPreShadowRemovalProtocolMerges != 0);
 
             CHECK(mMergeCounters.mNewMetaEntries == 0);
             CHECK(mMergeCounters.mNewInitEntries == 0);
@@ -525,6 +875,16 @@ class StopAndRestartBucketMergesTest
                   other.mMergeCounters.mPreInitEntryProtocolMerges);
             CHECK(mMergeCounters.mPostInitEntryProtocolMerges ==
                   other.mMergeCounters.mPostInitEntryProtocolMerges);
+
+            CHECK(mMergeCounters.mPreShadowRemovalProtocolMerges ==
+                  other.mMergeCounters.mPreShadowRemovalProtocolMerges);
+            CHECK(mMergeCounters.mPostShadowRemovalProtocolMerges ==
+                  other.mMergeCounters.mPostShadowRemovalProtocolMerges);
+
+            CHECK(mMergeCounters.mRunningMergeReattachments ==
+                  other.mMergeCounters.mRunningMergeReattachments);
+            CHECK(mMergeCounters.mFinishedMergeReattachments ==
+                  other.mMergeCounters.mFinishedMergeReattachments);
 
             CHECK(mMergeCounters.mNewMetaEntries ==
                   other.mMergeCounters.mNewMetaEntries);
@@ -741,7 +1101,7 @@ class StopAndRestartBucketMergesTest
             << "Collecting control surveys in ledger range 2.." << std::dec
             << finalLedger << " = 0x" << std::hex << finalLedger;
         auto app =
-            createTestApplication<LedgerManagerTestApplication>(clock, cfg);
+            createTestApplication<BucketManagerTestApplication>(clock, cfg);
         app->start();
 
         std::vector<LedgerKey> allKeys;
@@ -861,7 +1221,7 @@ class StopAndRestartBucketMergesTest
             mDesignatedLedgers.begin(), mDesignatedLedgers.size() / 2));
 
         auto app =
-            createTestApplication<LedgerManagerTestApplication>(*clock, cfg);
+            createTestApplication<BucketManagerTestApplication>(*clock, cfg);
         app->start();
         CLOG(INFO, "Bucket")
             << "Running stop/restart test in ledger range 2.." << std::dec
@@ -921,7 +1281,7 @@ class StopAndRestartBucketMergesTest
                 CLOG(INFO, "Bucket")
                     << "Restarting application at ledger " << std::dec << i;
                 clock = std::make_unique<VirtualClock>();
-                app = createTestApplication<LedgerManagerTestApplication>(
+                app = createTestApplication<BucketManagerTestApplication>(
                     *clock, cfg, false);
                 app->start();
                 if (BucketList::levelShouldSpill(i, mDesignatedLevel - 1))
@@ -966,7 +1326,7 @@ class StopAndRestartBucketMergesTest
             mControlSurveys.rbegin()->second.dumpMergeCounters(
                 "control, Post-INITENTRY", mDesignatedLevel);
             mControlSurveys.rbegin()
-                ->second.checkSensiblePostInitEntryMergeCounters();
+                ->second.checkSensiblePostInitEntryMergeCounters(mProtocol);
         }
         else
         {
@@ -985,7 +1345,8 @@ TEST_CASE("bucket persistence over app restart with initentry",
 {
     for (uint32_t protocol :
          {Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY - 1,
-          Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY})
+          Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+          Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED})
     {
         for (uint32_t level : {2, 3})
         {
@@ -1001,7 +1362,8 @@ TEST_CASE("bucket persistence over app restart with initentry - extended",
 {
     for (uint32_t protocol :
          {Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY - 1,
-          Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY})
+          Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+          Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED})
     {
         for (uint32_t level : {2, 3, 4, 5})
         {

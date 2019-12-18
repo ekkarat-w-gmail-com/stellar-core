@@ -44,10 +44,12 @@ class BucketOutputIterator
     // the form of a METAENTRY; but that's not a thing the caller gets to decide
     // (or forget to do), it's handled automatically.
     BucketOutputIterator(std::string const& tmpDir, bool keepDeadEntries,
-                         BucketMetadata const& meta, MergeCounters& mc);
+                         BucketMetadata const& meta, MergeCounters& mc,
+                         bool doFsync);
 
     void put(BucketEntry const& e);
 
-    std::shared_ptr<Bucket> getBucket(BucketManager& bucketManager);
+    std::shared_ptr<Bucket> getBucket(BucketManager& bucketManager,
+                                      MergeKey* mergeKey = nullptr);
 };
 }

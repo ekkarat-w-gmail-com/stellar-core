@@ -14,17 +14,7 @@
 #include "test/TestExceptions.h"
 #include "test/TestUtils.h"
 #include "test/test.h"
-#include "transactions/AllowTrustOpFrame.h"
-#include "transactions/BumpSequenceOpFrame.h"
-#include "transactions/ChangeTrustOpFrame.h"
-#include "transactions/CreateAccountOpFrame.h"
-#include "transactions/InflationOpFrame.h"
-#include "transactions/ManageDataOpFrame.h"
-#include "transactions/ManageSellOfferOpFrame.h"
-#include "transactions/MergeOpFrame.h"
-#include "transactions/PathPaymentOpFrame.h"
-#include "transactions/PaymentOpFrame.h"
-#include "transactions/SetOptionsOpFrame.h"
+#include "transactions/OperationFrame.h"
 #include "transactions/TransactionFrame.h"
 #include "transactions/TransactionUtils.h"
 #include "util/Logging.h"
@@ -409,12 +399,16 @@ getAccountSigners(PublicKey const& k, Application& app)
 
 TransactionFramePtr
 transactionFromOperations(Application& app, SecretKey const& from,
-                          SequenceNumber seq, const std::vector<Operation>& ops)
+                          SequenceNumber seq, const std::vector<Operation>& ops,
+                          int fee)
 {
     auto e = TransactionEnvelope{};
     e.tx.sourceAccount = from.getPublicKey();
-    e.tx.fee = static_cast<uint32_t>(
-        (ops.size() * app.getLedgerManager().getLastTxFee()) & UINT32_MAX);
+    e.tx.fee = fee != 0
+                   ? fee
+                   : static_cast<uint32_t>(
+                         (ops.size() * app.getLedgerManager().getLastTxFee()) &
+                         UINT32_MAX);
     e.tx.seqNum = seq;
     std::copy(std::begin(ops), std::end(ops),
               std::back_inserter(e.tx.operations));
@@ -530,12 +524,30 @@ pathPayment(PublicKey const& to, Asset const& sendCur, int64_t sendMax,
             std::vector<Asset> const& path)
 {
     Operation op;
-    op.body.type(PATH_PAYMENT);
-    PathPaymentOp& ppop = op.body.pathPaymentOp();
+    op.body.type(PATH_PAYMENT_STRICT_RECEIVE);
+    PathPaymentStrictReceiveOp& ppop = op.body.pathPaymentStrictReceiveOp();
     ppop.sendAsset = sendCur;
     ppop.sendMax = sendMax;
     ppop.destAsset = destCur;
     ppop.destAmount = destAmount;
+    ppop.destination = to;
+    std::copy(std::begin(path), std::end(path), std::back_inserter(ppop.path));
+
+    return op;
+}
+
+Operation
+pathPaymentStrictSend(PublicKey const& to, Asset const& sendCur,
+                      int64_t sendAmount, Asset const& destCur, int64_t destMin,
+                      std::vector<Asset> const& path)
+{
+    Operation op;
+    op.body.type(PATH_PAYMENT_STRICT_SEND);
+    PathPaymentStrictSendOp& ppop = op.body.pathPaymentStrictSendOp();
+    ppop.sendAsset = sendCur;
+    ppop.sendAmount = sendAmount;
+    ppop.destAsset = destCur;
+    ppop.destMin = destMin;
     ppop.destination = to;
     std::copy(std::begin(path), std::end(path), std::back_inserter(ppop.path));
 

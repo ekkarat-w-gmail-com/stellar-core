@@ -10,6 +10,8 @@
 #include "main/ErrorMessages.h"
 #include "util/Fs.h"
 #include "util/Logging.h"
+#include "util/format.h"
+
 #include <medida/meter.h>
 #include <medida/metrics_registry.h>
 
@@ -21,7 +23,7 @@ namespace stellar
 VerifyBucketWork::VerifyBucketWork(
     Application& app, std::map<std::string, std::shared_ptr<Bucket>>& buckets,
     std::string const& bucketFile, uint256 const& hash)
-    : BasicWork(app, "verify-bucket-hash-" + bucketFile, RETRY_NEVER)
+    : BasicWork(app, "verify-bucket-hash-" + bucketFile, BasicWork::RETRY_NEVER)
     , mBuckets(buckets)
     , mBucketFile(bucketFile)
     , mHash(hash)
@@ -77,6 +79,9 @@ VerifyBucketWork::spawnVerifier()
             auto hasher = SHA256::create();
             asio::error_code ec;
             {
+                CLOG(INFO, "History")
+                    << fmt::format("Verifying bucket {}", binToHex(hash));
+
                 // ensure that the stream gets its own scope to avoid race with
                 // main thread
                 std::ifstream in(filename, std::ifstream::binary);

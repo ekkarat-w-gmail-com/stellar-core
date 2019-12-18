@@ -10,6 +10,7 @@
 #include "ledger/SyncingLedgerChain.h"
 #include "main/PersistentState.h"
 #include "transactions/TransactionFrame.h"
+#include "util/XDRStream.h"
 #include "xdr/Stellar-ledger.h"
 #include <string>
 
@@ -39,6 +40,7 @@ class LedgerManagerImpl : public LedgerManager
 
   protected:
     Application& mApp;
+    std::unique_ptr<XDROutputFileStream> mMetaStream;
 
   private:
     medida::Timer& mTransactionApply;
@@ -51,6 +53,9 @@ class LedgerManagerImpl : public LedgerManager
     medida::Counter& mPrefetchHitRate;
     VirtualClock::time_point mLastClose;
 
+    std::unique_ptr<VirtualClock::time_point> mStartCatchup;
+    medida::Timer& mCatchupDuration;
+
     medida::Counter& mSyncingLedgersSize;
     uint32_t mCatchupTriggerLedger{0};
 
@@ -59,17 +64,19 @@ class LedgerManagerImpl : public LedgerManager
     void addToSyncingLedgers(LedgerCloseData const& ledgerData);
     void startCatchupIf(uint32_t lastReceivedLedgerSeq);
 
-    void historyCaughtup(asio::error_code const& ec,
-                         CatchupWork::ProgressState progressState,
+    void historyCaughtup(CatchupWork::ProgressState progressState,
                          LedgerHeaderHistoryEntry const& lastClosed,
                          CatchupConfiguration::Mode catchupMode);
 
-    void processFeesSeqNums(std::vector<TransactionFramePtr>& txs,
-                            AbstractLedgerTxn& ltxOuter, int64_t baseFee);
+    void
+    processFeesSeqNums(std::vector<TransactionFramePtr>& txs,
+                       AbstractLedgerTxn& ltxOuter, int64_t baseFee,
+                       std::unique_ptr<LedgerCloseMeta> const& ledgerCloseMeta);
 
-    void applyTransactions(std::vector<TransactionFramePtr>& txs,
-                           AbstractLedgerTxn& ltx,
-                           TransactionResultSet& txResultSet);
+    void
+    applyTransactions(std::vector<TransactionFramePtr>& txs,
+                      AbstractLedgerTxn& ltx, TransactionResultSet& txResultSet,
+                      std::unique_ptr<LedgerCloseMeta> const& ledgerCloseMeta);
 
     void ledgerClosed(AbstractLedgerTxn& ltx);
 
@@ -95,7 +102,6 @@ class LedgerManagerImpl : public LedgerManager
 
     SyncingLedgerChain mSyncingLedgers;
 
-    void applyBufferedLedgers();
     void setCatchupState(CatchupState s);
     void advanceLedgerPointers(LedgerHeader const& header);
 
@@ -124,7 +130,7 @@ class LedgerManagerImpl : public LedgerManager
     uint64_t secondsSinceLastLedgerClose() const override;
     void syncMetrics() override;
 
-    void startNewLedger(LedgerHeader genesisLedger);
+    void startNewLedger(LedgerHeader const& genesisLedger);
     void startNewLedger() override;
     void loadLastKnownLedger(
         std::function<void(asio::error_code const& ec)> handler) override;
@@ -135,10 +141,16 @@ class LedgerManagerImpl : public LedgerManager
 
     Database& getDatabase() override;
 
-    void startCatchup(CatchupConfiguration configuration) override;
+    void startCatchup(CatchupConfiguration configuration,
+                      std::shared_ptr<HistoryArchive> archive) override;
 
     void closeLedger(LedgerCloseData const& ledgerData) override;
     void deleteOldEntries(Database& db, uint32_t ledgerSeq,
                           uint32_t count) override;
+
+    bool hasBufferedLedger() const override;
+    LedgerCloseData popBufferedLedger() override;
+
+    void setupLedgerCloseMetaStream();
 };
 }

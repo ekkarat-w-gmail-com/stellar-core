@@ -7,7 +7,9 @@
 #include "bucket/Bucket.h"
 #include "overlay/StellarXDR.h"
 #include "util/NonCopyable.h"
+#include <future>
 #include <memory>
+#include <set>
 
 #include "medida/timer_context.h"
 
@@ -18,6 +20,7 @@ class Application;
 class BucketList;
 class TmpDirManager;
 struct LedgerHeader;
+struct MergeKey;
 struct HistoryArchiveState;
 
 // A fine-grained merge-operation-counter structure for tracking various
@@ -28,6 +31,12 @@ struct MergeCounters
 {
     uint64_t mPreInitEntryProtocolMerges{0};
     uint64_t mPostInitEntryProtocolMerges{0};
+
+    uint64_t mRunningMergeReattachments{0};
+    uint64_t mFinishedMergeReattachments{0};
+
+    uint64_t mPreShadowRemovalProtocolMerges{0};
+    uint64_t mPostShadowRemovalProtocolMerges{0};
 
     uint64_t mNewMetaEntries{0};
     uint64_t mNewInitEntries{0};
@@ -55,6 +64,7 @@ struct MergeCounters
     uint64_t mOutputIteratorBufferUpdates{0};
     uint64_t mOutputIteratorActualWrites{0};
     MergeCounters& operator+=(MergeCounters const& delta);
+    bool operator==(MergeCounters const& other) const;
 };
 
 /**
@@ -91,7 +101,7 @@ class BucketManager : NonMovableOrCopyable
     virtual void dropAll() = 0;
     virtual std::string const& getTmpDir() = 0;
     virtual TmpDirManager& getTmpDirManager() = 0;
-    virtual std::string const& getBucketDir() = 0;
+    virtual std::string const& getBucketDir() const = 0;
     virtual BucketList& getBucketList() = 0;
 
     virtual medida::Timer& getMergeTimer() = 0;
@@ -114,10 +124,41 @@ class BucketManager : NonMovableOrCopyable
     // worker threads. Very carefully.
     virtual std::shared_ptr<Bucket>
     adoptFileAsBucket(std::string const& filename, uint256 const& hash,
-                      size_t nObjects, size_t nBytes) = 0;
+                      size_t nObjects, size_t nBytes,
+                      MergeKey* mergeKey = nullptr) = 0;
+
+    // Companion method to `adoptFileAsBucket` also called from the
+    // `BucketOutputIterator::getBucket` merge-completion path. This method
+    // however should be called when the output bucket is _empty_ and thereby
+    // doesn't correspond to a file on disk; the method forgets about the
+    // `FutureBucket` associated with the in-progress merge, allowing the merge
+    // inputs to be GC'ed.
+    virtual void noteEmptyMergeOutput(MergeKey const& mergeKey) = 0;
 
     // Return a bucket by hash if we have it, else return nullptr.
     virtual std::shared_ptr<Bucket> getBucketByHash(uint256 const& hash) = 0;
+
+    // Get a reference to a merge-future that's either running (or finished
+    // somewhat recently) from either a map of the std::shared_futures doing the
+    // merges and/or a set of records mapping merge inputs to outputs and the
+    // set of outputs held in the BucketManager. Returns an invalid future if no
+    // such future can be found or synthesized.
+    virtual std::shared_future<std::shared_ptr<Bucket>>
+    getMergeFuture(MergeKey const& key) = 0;
+
+    // Add a reference to a merge _in progress_ (not yet adopted as a file) to
+    // the BucketManager's internal map of std::shared_futures doing merges.
+    // There is no corresponding entry-removal API: the std::shared_future will
+    // be removed from the map when the merge completes and the output file is
+    // adopted.
+    virtual void
+    putMergeFuture(MergeKey const& key,
+                   std::shared_future<std::shared_ptr<Bucket>>) = 0;
+
+#ifdef BUILD_TESTS
+    // Drop all references to merge futures in progress.
+    virtual void clearMergeFuturesForTesting() = 0;
+#endif
 
     // Forget any buckets not referenced by the current BucketList. This will
     // not immediately cause the buckets to delete themselves, if someone else
@@ -138,6 +179,23 @@ class BucketManager : NonMovableOrCopyable
     // Update the given LedgerHeader's bucketListHash to reflect the current
     // state of the bucket list.
     virtual void snapshotLedger(LedgerHeader& currentHeader) = 0;
+
+#ifdef BUILD_TESTS
+    // Install a fake/assumed ledger version and bucket list hash to use in next
+    // call to addBatch and snapshotLedger. This interface exists only for
+    // testing in a specific type of history replay.
+    virtual void setNextCloseVersionAndHashForTesting(uint32_t protocolVers,
+                                                      uint256 const& hash) = 0;
+
+    // Return the set of buckets in the current `getBucketDir()` directory.
+    // This interface exists only for checking that the BucketDir isn't
+    // leaking buckets, in tests.
+    virtual std::set<Hash> getBucketHashesInBucketDirForTesting() const = 0;
+#endif
+
+    // Return the set of buckets referenced by the BucketList, LCL HAS,
+    // and publish queue.
+    virtual std::set<Hash> getReferencedBuckets() const = 0;
 
     // Check for missing bucket files that would prevent `assumeState` from
     // succeeding

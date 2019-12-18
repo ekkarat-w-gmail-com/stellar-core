@@ -29,7 +29,8 @@ getOfferBuyingLiabilities(LedgerEntry const& le)
 {
     auto const& oe = le.data.offer();
     auto res = exchangeV10WithoutPriceErrorThresholds(
-        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX, false);
+        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX,
+        RoundingType::NORMAL);
     return res.numSheepSend;
 }
 
@@ -38,7 +39,8 @@ getOfferSellingLiabilities(LedgerEntry const& le)
 {
     auto const& oe = le.data.offer();
     auto res = exchangeV10WithoutPriceErrorThresholds(
-        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX, false);
+        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX,
+        RoundingType::NORMAL);
     return res.numWheatReceived;
 }
 
@@ -172,9 +174,9 @@ shouldCheckAccount(std::shared_ptr<LedgerEntry const> const& current,
     if (ledgerVersion >= 10)
     {
         bool sellingLiabilitiesInc =
-            getSellingLiabilities(*current) > getSellingLiabilities(*current);
+            getSellingLiabilities(*current) > getSellingLiabilities(*previous);
         bool buyingLiabilitiesInc =
-            getBuyingLiabilities(*current) > getBuyingLiabilities(*current);
+            getBuyingLiabilities(*current) > getBuyingLiabilities(*previous);
         bool didLiabilitiesIncrease =
             sellingLiabilitiesInc || buyingLiabilitiesInc;
         return didBalanceDecrease || didLiabilitiesIncrease;
@@ -251,10 +253,7 @@ LiabilitiesMatchOffers::LiabilitiesMatchOffers() : Invariant(false)
 std::string
 LiabilitiesMatchOffers::getName() const
 {
-    // NOTE: In order for the acceptance tests to run correctly, this will
-    // currently need to read "MinimumAccountBalance". We will update this to
-    // "LiabilitiesMatchOffers" after.
-    return "MinimumAccountBalance";
+    return "LiabilitiesMatchOffers";
 }
 
 std::string

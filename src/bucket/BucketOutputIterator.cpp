@@ -35,8 +35,10 @@ randomBucketName(std::string const& tmpDir)
 BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
                                            bool keepDeadEntries,
                                            BucketMetadata const& meta,
-                                           MergeCounters& mc)
+                                           MergeCounters& mc,
+                                           asio::io_context& ctx, bool doFsync)
     : mFilename(randomBucketName(tmpDir))
+    , mOut(ctx, doFsync)
     , mBuf(nullptr)
     , mHasher(SHA256::create())
     , mKeepDeadEntries(keepDeadEntries)
@@ -105,7 +107,8 @@ BucketOutputIterator::put(BucketEntry const& e)
 }
 
 std::shared_ptr<Bucket>
-BucketOutputIterator::getBucket(BucketManager& bucketManager)
+BucketOutputIterator::getBucket(BucketManager& bucketManager,
+                                MergeKey* mergeKey)
 {
     if (mBuf)
     {
@@ -121,9 +124,13 @@ BucketOutputIterator::getBucket(BucketManager& bucketManager)
         assert(mBytesPut == 0);
         CLOG(DEBUG, "Bucket") << "Deleting empty bucket file " << mFilename;
         std::remove(mFilename.c_str());
+        if (mergeKey)
+        {
+            bucketManager.noteEmptyMergeOutput(*mergeKey);
+        }
         return std::make_shared<Bucket>();
     }
     return bucketManager.adoptFileAsBucket(mFilename, mHasher->finish(),
-                                           mObjectsPut, mBytesPut);
+                                           mObjectsPut, mBytesPut, mergeKey);
 }
 }

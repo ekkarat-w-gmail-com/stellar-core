@@ -14,6 +14,7 @@ namespace medida
 class Counter;
 class Meter;
 class Timer;
+class Histogram;
 }
 
 namespace stellar
@@ -87,8 +88,11 @@ class HerderSCPDriver : public SCPDriver
 
     void recordSCPExecutionMetrics(uint64_t slotIndex);
     void recordSCPEvent(uint64_t slotIndex, bool isNomination);
+    void recordSCPExternalizeEvent(uint64_t slotIndex, NodeID const& id,
+                                   bool forceUpdateSelf);
 
     // envelope handling
+    SCPEnvelopeWrapperPtr wrapEnvelope(SCPEnvelope const& envelope) override;
     void signEnvelope(SCPEnvelope& envelope) override;
     void emitEnvelope(SCPEnvelope const& envelope) override;
 
@@ -96,7 +100,8 @@ class HerderSCPDriver : public SCPDriver
     SCPDriver::ValidationLevel validateValue(uint64_t slotIndex,
                                              Value const& value,
                                              bool nomination) override;
-    Value extractValidValue(uint64_t slotIndex, Value const& value) override;
+    ValueWrapperPtr extractValidValue(uint64_t slotIndex,
+                                      Value const& value) override;
 
     // value marshaling
     std::string toShortString(PublicKey const& pk) const override;
@@ -108,8 +113,9 @@ class HerderSCPDriver : public SCPDriver
                     std::function<void()> cb) override;
 
     // core SCP
-    Value combineCandidates(uint64_t slotIndex,
-                            std::set<Value> const& candidates) override;
+    ValueWrapperPtr
+    combineCandidates(uint64_t slotIndex,
+                      ValueWrapperPtrSet const& candidates) override;
     void valueExternalized(uint64_t slotIndex, Value const& value) override;
 
     // Submit a value to consider for slotIndex
@@ -142,6 +148,14 @@ class HerderSCPDriver : public SCPDriver
     bool checkCloseTime(uint64_t slotIndex, uint64_t lastCloseTime,
                         StellarValue const& b) const;
 
+    // wraps a *valid* StellarValue (throws if it can't find txSet/qSet)
+    ValueWrapperPtr wrapStellarValue(StellarValue const& sv);
+
+    ValueWrapperPtr wrapValue(Value const& sv) override;
+
+    // clean up older slots
+    void purgeSlots(uint64_t maxSlotIndex);
+
   private:
     Application& mApp;
     HerderImpl& mHerder;
@@ -164,15 +178,33 @@ class HerderSCPDriver : public SCPDriver
         medida::Timer& mNominateToPrepare;
         medida::Timer& mPrepareToExternalize;
 
+        // Timers tracking externalize messages
+        medida::Timer& mExternalizeLag;
+        medida::Timer& mExternalizeDelay;
+
         SCPMetrics(Application& app);
     };
 
     SCPMetrics mSCPMetrics;
 
+    // Nomination timeouts per ledger
+    medida::Histogram& mNominateTimeout;
+    // Prepare timeouts per ledger
+    medida::Histogram& mPrepareTimeout;
+
     struct SCPTiming
     {
         optional<VirtualClock::time_point> mNominationStart;
         optional<VirtualClock::time_point> mPrepareStart;
+
+        // Nomination timeouts before first prepare
+        int64_t mNominationTimeoutCount{0};
+        // Prepare timeouts before externalize
+        int64_t mPrepareTimeoutCount{0};
+
+        // externalize timing information
+        optional<VirtualClock::time_point> mFirstExternalize;
+        optional<VirtualClock::time_point> mSelfExternalize;
     };
 
     // Map of time points for each slot to measure key protocol metrics:
@@ -181,7 +213,7 @@ class HerderSCPDriver : public SCPDriver
     std::map<uint64_t, SCPTiming> mSCPExecutionTimes;
 
     uint32_t mLedgerSeqNominating;
-    Value mCurrentValue;
+    ValueWrapperPtr mCurrentValue;
 
     // timers used by SCP
     // indexed by slotIndex, timerID
@@ -205,15 +237,17 @@ class HerderSCPDriver : public SCPDriver
                                                    StellarValue const& sv,
                                                    bool nomination) const;
 
-    // returns true if the local instance is in a state compatible with
-    // this slot
-    bool isSlotCompatibleWithCurrentState(uint64_t slotIndex) const;
-
     void logQuorumInformation(uint64_t index);
 
     void clearSCPExecutionEvents();
 
     void timerCallbackWrapper(uint64_t slotIndex, int timerID,
                               std::function<void()> cb);
+
+    void recordLogTiming(VirtualClock::time_point start,
+                         VirtualClock::time_point end, medida::Timer& timer,
+                         std::string const& logStr,
+                         std::chrono::nanoseconds threshold,
+                         uint64_t slotIndex);
 };
 }

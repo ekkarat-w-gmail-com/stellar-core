@@ -14,6 +14,7 @@
 #include "util/numeric.h"
 #include "xdrpp/marshal.h"
 #include <algorithm>
+#include <functional>
 #include <unordered_set>
 
 namespace stellar
@@ -157,9 +158,6 @@ bool
 LocalNode::isQuorumSlice(SCPQuorumSet const& qSet,
                          std::vector<NodeID> const& nodeSet)
 {
-    CLOG(TRACE, "SCP") << "LocalNode::isQuorumSlice"
-                       << " nodeSet.size: " << nodeSet.size();
-
     return isQuorumSliceInternal(qSet, nodeSet);
 }
 
@@ -209,21 +207,18 @@ bool
 LocalNode::isVBlocking(SCPQuorumSet const& qSet,
                        std::vector<NodeID> const& nodeSet)
 {
-    CLOG(TRACE, "SCP") << "LocalNode::isVBlocking"
-                       << " nodeSet.size: " << nodeSet.size();
-
     return isVBlockingInternal(qSet, nodeSet);
 }
 
 bool
 LocalNode::isVBlocking(SCPQuorumSet const& qSet,
-                       std::map<NodeID, SCPEnvelope> const& map,
+                       std::map<NodeID, SCPEnvelopeWrapperPtr> const& map,
                        std::function<bool(SCPStatement const&)> const& filter)
 {
     std::vector<NodeID> pNodes;
     for (auto const& it : map)
     {
-        if (filter(it.second.statement))
+        if (filter(it.second->getStatement()))
         {
             pNodes.push_back(it.first);
         }
@@ -234,14 +229,15 @@ LocalNode::isVBlocking(SCPQuorumSet const& qSet,
 
 bool
 LocalNode::isQuorum(
-    SCPQuorumSet const& qSet, std::map<NodeID, SCPEnvelope> const& map,
+    SCPQuorumSet const& qSet,
+    std::map<NodeID, SCPEnvelopeWrapperPtr> const& map,
     std::function<SCPQuorumSetPtr(SCPStatement const&)> const& qfun,
     std::function<bool(SCPStatement const&)> const& filter)
 {
     std::vector<NodeID> pNodes;
     for (auto const& it : map)
     {
-        if (filter(it.second.statement))
+        if (filter(it.second->getStatement()))
         {
             pNodes.push_back(it.first);
         }
@@ -253,7 +249,7 @@ LocalNode::isQuorum(
         count = pNodes.size();
         std::vector<NodeID> fNodes(pNodes.size());
         auto quorumFilter = [&](NodeID nodeID) -> bool {
-            auto qSetPtr = qfun(map.find(nodeID)->second.statement);
+            auto qSetPtr = qfun(map.find(nodeID)->second->getStatement());
             if (qSetPtr)
             {
                 return isQuorumSlice(*qSetPtr, pNodes);
@@ -274,14 +270,15 @@ LocalNode::isQuorum(
 
 std::vector<NodeID>
 LocalNode::findClosestVBlocking(
-    SCPQuorumSet const& qset, std::map<NodeID, SCPEnvelope> const& map,
+    SCPQuorumSet const& qset,
+    std::map<NodeID, SCPEnvelopeWrapperPtr> const& map,
     std::function<bool(SCPStatement const&)> const& filter,
     NodeID const* excluded)
 {
     std::set<NodeID> s;
     for (auto const& n : map)
     {
-        if (filter(n.second.statement))
+        if (filter(n.second->getStatement()))
         {
             s.emplace(n.first);
         }
@@ -325,7 +322,8 @@ LocalNode::findClosestVBlocking(SCPQuorumSet const& qset,
     struct orderBySize
     {
         bool
-        operator()(std::vector<NodeID> const& v1, std::vector<NodeID> const& v2)
+        operator()(std::vector<NodeID> const& v1,
+                   std::vector<NodeID> const& v2) const
         {
             return v1.size() < v2.size();
         }
@@ -373,16 +371,25 @@ LocalNode::findClosestVBlocking(SCPQuorumSet const& qset,
 Json::Value
 LocalNode::toJson(SCPQuorumSet const& qSet, bool fullKeys) const
 {
+    return toJson(qSet, [&](PublicKey const& k) {
+        return mSCP->getDriver().toStrKey(k, fullKeys);
+    });
+}
+
+Json::Value
+LocalNode::toJson(SCPQuorumSet const& qSet,
+                  std::function<std::string(PublicKey const&)> r)
+{
     Json::Value ret;
     ret["t"] = qSet.threshold;
     auto& entries = ret["v"];
     for (auto const& v : qSet.validators)
     {
-        entries.append(mSCP->getDriver().toStrKey(v, fullKeys));
+        entries.append(r(v));
     }
     for (auto const& s : qSet.innerSets)
     {
-        entries.append(toJson(s, fullKeys));
+        entries.append(toJson(s, r));
     }
     return ret;
 }

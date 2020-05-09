@@ -20,9 +20,9 @@ Levels:
 namespace stellar
 {
 
-std::array<std::string const, 13> const Logging::kPartitionNames = {
-    "Fs",      "SCP",    "Bucket", "Database", "History", "Process",  "Ledger",
-    "Overlay", "Herder", "Tx",     "LoadGen",  "Work",    "Invariant"};
+std::array<std::string const, 14> const Logging::kPartitionNames = {
+    "Fs",      "SCP",    "Bucket", "Database", "History", "Process",   "Ledger",
+    "Overlay", "Herder", "Tx",     "LoadGen",  "Work",    "Invariant", "Perf"};
 
 el::Configurations Logging::gDefaultConf;
 
@@ -87,7 +87,7 @@ Logging::setFmt(std::string const& peerID, bool timestamps)
 
     gDefaultConf.setGlobally(el::ConfigurationType::Format, shortFmt);
     gDefaultConf.set(el::Level::Error, el::ConfigurationType::Format, longFmt);
-    gDefaultConf.set(el::Level::Trace, el::ConfigurationType::Format, longFmt);
+    gDefaultConf.set(el::Level::Trace, el::ConfigurationType::Format, shortFmt);
     gDefaultConf.set(el::Level::Fatal, el::ConfigurationType::Format, longFmt);
     el::Loggers::reconfigureAllLoggers(gDefaultConf);
 }

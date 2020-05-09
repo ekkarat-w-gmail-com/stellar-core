@@ -31,11 +31,18 @@ BanManagerImpl::~BanManagerImpl()
 void
 BanManagerImpl::banNode(NodeID nodeID)
 {
+    if (isBanned(nodeID))
+    {
+        return;
+    }
+
     auto nodeIDString = KeyUtils::toStrKey(nodeID);
+
+    CLOG(INFO, "Overlay") << "ban " << nodeIDString;
+
     auto timer = mApp.getDatabase().getInsertTimer("ban");
     auto prep = mApp.getDatabase().getPreparedStatement(
-        "INSERT INTO ban (nodeid) "
-        "SELECT :n WHERE NOT EXISTS (SELECT 1 FROM ban WHERE nodeid = :n)");
+        "INSERT INTO ban (nodeid) VALUES(:n)");
     auto& st = prep.statement();
     st.exchange(soci::use(nodeIDString));
     st.define_and_bind();
@@ -46,6 +53,7 @@ void
 BanManagerImpl::unbanNode(NodeID nodeID)
 {
     auto nodeIDString = KeyUtils::toStrKey(nodeID);
+    CLOG(INFO, "Overlay") << "unban " << nodeIDString;
     auto timer = mApp.getDatabase().getDeleteTimer("ban");
     auto prep = mApp.getDatabase().getPreparedStatement(
         "DELETE FROM ban WHERE nodeid = :n;");

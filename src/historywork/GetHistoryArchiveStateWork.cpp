@@ -16,10 +16,9 @@
 namespace stellar
 {
 GetHistoryArchiveStateWork::GetHistoryArchiveStateWork(
-    Application& app, HistoryArchiveState& state, uint32_t seq,
-    std::shared_ptr<HistoryArchive> archive, size_t maxRetries)
+    Application& app, uint32_t seq, std::shared_ptr<HistoryArchive> archive,
+    std::string mode, size_t maxRetries)
     : Work(app, "get-archive-state", maxRetries)
-    , mState(state)
     , mSeq(seq)
     , mArchive(archive)
     , mRetries(maxRetries)
@@ -28,7 +27,9 @@ GetHistoryArchiveStateWork::GetHistoryArchiveStateWork(
                   : app.getHistoryManager().localFilename(
                         HistoryArchiveState::baseName()))
     , mGetHistoryArchiveStateSuccess(app.getMetrics().NewMeter(
-          {"history", "download-history-archive-state", "success"}, "event"))
+          {"history", "download-history-archive-state" + std::move(mode),
+           "success"},
+          "event"))
 {
 }
 
@@ -61,8 +62,8 @@ GetHistoryArchiveStateWork::doWork()
 
     else
     {
-        auto name = mSeq == 0 ? HistoryArchiveState::wellKnownRemoteName()
-                              : HistoryArchiveState::remoteName(mSeq);
+        auto name = getRemoteName();
+        CLOG(INFO, "History") << "Downloading history archive state: " << name;
         mGetRemoteFile = addWork<GetRemoteFileWork>(name, mLocalFilename,
                                                     mArchive, mRetries);
         return State::WORK_RUNNING;
@@ -74,6 +75,7 @@ GetHistoryArchiveStateWork::doReset()
 {
     mGetRemoteFile.reset();
     std::remove(mLocalFilename.c_str());
+    mState = {};
 }
 
 void
@@ -81,5 +83,20 @@ GetHistoryArchiveStateWork::onSuccess()
 {
     mGetHistoryArchiveStateSuccess.Mark();
     Work::onSuccess();
+}
+
+std::string
+GetHistoryArchiveStateWork::getRemoteName() const
+{
+    return mSeq == 0 ? HistoryArchiveState::wellKnownRemoteName()
+                     : HistoryArchiveState::remoteName(mSeq);
+}
+
+std::string
+GetHistoryArchiveStateWork::getStatus() const
+{
+    std::string ledgerString = mSeq == 0 ? "current" : std::to_string(mSeq);
+    return fmt::format("Downloading state file {} for ledger {}",
+                       getRemoteName(), ledgerString);
 }
 }

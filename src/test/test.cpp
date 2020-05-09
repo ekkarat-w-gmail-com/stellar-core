@@ -53,18 +53,9 @@ struct ReseedPRNGListener : Catch::TestEventListenerBase
     static void
     reseed()
     {
-        if (sCommandLineSeed == 0)
-        {
-            srand(1);
-            gRandomEngine.seed(gRandomEngine.default_seed);
-            Catch::rng().seed(Catch::rng().default_seed);
-        }
-        else
-        {
-            srand(sCommandLineSeed);
-            gRandomEngine.seed(sCommandLineSeed);
-            Catch::rng().seed(sCommandLineSeed);
-        }
+        srand(sCommandLineSeed);
+        gRandomEngine.seed(sCommandLineSeed);
+        Catch::rng().seed(sCommandLineSeed);
     }
     virtual void
     testCaseStarting(Catch::TestCaseInfo const& testInfo) override
@@ -106,7 +97,14 @@ getTestConfig(int instanceNumber, Config::TestDbMode mode)
 
     if (!cfgs[instanceNumber])
     {
-        gTestRoots.emplace_back("stellar-core-test");
+        if (gTestRoots.empty())
+        {
+            gTestRoots.emplace_back(
+                fmt::format("stellar-core-test-{}", gBaseInstance));
+        }
+        auto const& testBase = gTestRoots[0].getName();
+        gTestRoots.emplace_back(
+            fmt::format("{}/test-{}", testBase, instanceNumber));
 
         std::string rootDir = gTestRoots.back().getName();
         rootDir += "/";
@@ -115,10 +113,6 @@ getTestConfig(int instanceNumber, Config::TestDbMode mode)
         Config& thisConfig = *cfgs[instanceNumber];
         thisConfig.USE_CONFIG_FOR_GENESIS = true;
 
-        std::ostringstream sstream;
-
-        sstream << "stellar" << instanceNumber << ".log";
-        thisConfig.LOG_FILE_PATH = sstream.str();
         thisConfig.BUCKET_DIR_PATH = rootDir + "bucket";
 
         thisConfig.INVARIANT_CHECKS = {".*"};
@@ -134,6 +128,10 @@ getTestConfig(int instanceNumber, Config::TestDbMode mode)
         // attempted.
         thisConfig.RUN_STANDALONE = true;
         thisConfig.FORCE_SCP = true;
+
+        thisConfig.MANUAL_CLOSE = true;
+
+        thisConfig.TEST_CASES_ENABLED = true;
 
         thisConfig.PEER_PORT =
             static_cast<unsigned short>(DEFAULT_PEER_PORT + instanceNumber * 2);
@@ -168,10 +166,12 @@ getTestConfig(int instanceNumber, Config::TestDbMode mode)
         {
         case Config::TESTDB_IN_MEMORY_SQLITE:
             dbname << "sqlite3://:memory:";
+            // When we're running on an in-memory sqlite we're
+            // probably not concerned with bucket durability.
+            thisConfig.DISABLE_XDR_FSYNC = true;
             break;
         case Config::TESTDB_ON_DISK_SQLITE:
-            dbname << "sqlite3://" << rootDir << "test" << instanceNumber
-                   << ".db";
+            dbname << "sqlite3://" << rootDir << "test.db";
             break;
 #ifdef USE_POSTGRES
         case Config::TESTDB_POSTGRESQL:
@@ -185,57 +185,11 @@ getTestConfig(int instanceNumber, Config::TestDbMode mode)
         thisConfig.REPORT_METRICS = gTestMetrics;
         // disable maintenance
         thisConfig.AUTOMATIC_MAINTENANCE_COUNT = 0;
+        // only spin up a small number of worker threads
+        thisConfig.WORKER_THREADS = 2;
+        thisConfig.QUORUM_INTERSECTION_CHECKER = false;
     }
     return *cfgs[instanceNumber];
-}
-
-int
-test(int argc, char* const* argv, el::Level ll,
-     std::vector<std::string> const& metrics)
-{
-    gTestMetrics = metrics;
-
-    // Note: Have to setLogLevel twice here to ensure --list-test-names-only is
-    // not mixed with stellar-core logging.
-    Logging::setFmt("<test>");
-    Logging::setLogLevel(ll, nullptr);
-    Config const& cfg = getTestConfig();
-    Logging::setLoggingToFile(cfg.LOG_FILE_PATH);
-    Logging::setLogLevel(ll, nullptr);
-
-    LOG(INFO) << "Testing stellar-core " << STELLAR_CORE_VERSION;
-    LOG(INFO) << "Logging to " << cfg.LOG_FILE_PATH;
-
-    using namespace Catch;
-    Session session{};
-
-    auto cli = session.cli();
-    cli |= clara::Opt(gTestAllVersions)["--all-versions"]("Test all versions");
-    cli |= clara::Opt(gVersionsToTest,
-                      "version")["--version"]("Test specific version(s)");
-    cli |= clara::Opt(gBaseInstance, "offset")["--base-instance"](
-        "Instance number offset so multiple instances of "
-        "stellar-core can run tests concurrently");
-    session.cli(cli);
-
-    auto r = session.applyCommandLine(argc, argv);
-    if (r != 0)
-        return r;
-    ReseedPRNGListener::sCommandLineSeed = session.configData().rngSeed;
-    ReseedPRNGListener::reseed();
-    if (gVersionsToTest.empty())
-    {
-        gVersionsToTest.emplace_back(Config::CURRENT_LEDGER_PROTOCOL_VERSION);
-    }
-    r = session.run();
-    gTestRoots.clear();
-    gTestCfg->clear();
-    if (r != 0 && ReseedPRNGListener::sCommandLineSeed != 0)
-    {
-        LOG(FATAL) << "Nonzero test result with --rng-seed "
-                   << ReseedPRNGListener::sCommandLineSeed;
-    }
-    return r;
 }
 
 int
@@ -244,6 +198,11 @@ runTest(CommandLineArgs const& args)
     el::Level logLevel{el::Level::Info};
 
     Catch::Session session{};
+
+    auto& seed = session.configData().rngSeed;
+
+    // rotate the seed every 24 hours
+    seed = static_cast<unsigned int>(std::time(nullptr)) / (24 * 3600);
 
     auto parser = session.cli();
     parser |= Catch::clara::Opt(
@@ -286,33 +245,41 @@ runTest(CommandLineArgs const& args)
         return 0;
     }
 
+    ReseedPRNGListener::sCommandLineSeed = seed;
+    ReseedPRNGListener::reseed();
+
     // Note: Have to setLogLevel twice here to ensure --list-test-names-only is
     // not mixed with stellar-core logging.
     Logging::setFmt("<test>");
     Logging::setLogLevel(logLevel, nullptr);
-    Config const& cfg = getTestConfig();
-    Logging::setLoggingToFile(cfg.LOG_FILE_PATH);
+    // use base instance for logging as we're guaranteed to not have conflicting
+    // instances of stellar-core running at the same time with the same base
+    // instance
+    auto logFile = fmt::format("stellar{}.log", gBaseInstance);
+    Logging::setLoggingToFile(logFile);
     Logging::setLogLevel(logLevel, nullptr);
-    auto seed = session.configData().rngSeed;
 
     LOG(INFO) << "Testing stellar-core " << STELLAR_CORE_VERSION;
-    LOG(INFO) << "Logging to " << cfg.LOG_FILE_PATH;
+    LOG(INFO) << "Logging to " << logFile;
 
     if (gVersionsToTest.empty())
     {
         gVersionsToTest.emplace_back(Config::CURRENT_LEDGER_PROTOCOL_VERSION);
     }
-    if (seed != 0)
-    {
-        stellar::gRandomEngine.seed(seed);
-    }
 
     auto r = session.run();
-    gTestRoots.clear();
-    gTestCfg->clear();
-    if (r != 0 && seed != 0)
+    while (!gTestRoots.empty())
     {
-        LOG(FATAL) << "Nonzero test result with --rng-seed " << seed;
+        // Don't call gTestRoots.clear() here -- order of deletion is
+        // not actually specified by vector::clear, and varies between
+        // different C++ stdlibs, and we're (ulp) relying on destructor
+        // order to clean up tmpdirs sensibly. Instead: pop repeatedly.
+        gTestRoots.pop_back();
+    }
+    gTestCfg->clear();
+    if (r != 0)
+    {
+        LOG(ERROR) << "Nonzero test result with --rng-seed " << seed;
     }
     return r;
 }

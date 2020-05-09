@@ -16,9 +16,12 @@
 #include "main/Config.h"
 #include "overlay/LoadManager.h"
 #include "overlay/OverlayManager.h"
+#include "overlay/OverlayMetrics.h"
 #include "overlay/PeerAuth.h"
 #include "overlay/PeerManager.h"
 #include "overlay/StellarXDR.h"
+#include "overlay/SurveyManager.h"
+#include "util/Decoder.h"
 #include "util/Logging.h"
 #include "util/XDROperators.h"
 
@@ -40,101 +43,24 @@ namespace stellar
 using namespace std;
 using namespace soci;
 
-medida::Meter&
-Peer::getByteReadMeter(Application& app)
-{
-    return app.getMetrics().NewMeter({"overlay", "byte", "read"}, "byte");
-}
-
-medida::Meter&
-Peer::getByteWriteMeter(Application& app)
-{
-    return app.getMetrics().NewMeter({"overlay", "byte", "write"}, "byte");
-}
+static constexpr VirtualClock::time_point PING_NOT_SENT =
+    VirtualClock::time_point::min();
 
 Peer::Peer(Application& app, PeerRole role)
     : mApp(app)
     , mRole(role)
     , mState(role == WE_CALLED_REMOTE ? CONNECTING : CONNECTED)
+    , mRemoteOverlayMinVersion(0)
     , mRemoteOverlayVersion(0)
-    , mIdleTimer(app)
+    , mCreationTime(app.getClock().now())
+    , mRecurringTimer(app)
     , mLastRead(app.getClock().now())
     , mLastWrite(app.getClock().now())
-    , mLastEmpty(app.getClock().now())
-
-    , mMessageRead(
-          app.getMetrics().NewMeter({"overlay", "message", "read"}, "message"))
-    , mMessageWrite(
-          app.getMetrics().NewMeter({"overlay", "message", "write"}, "message"))
-    , mByteRead(getByteReadMeter(app))
-    , mByteWrite(getByteWriteMeter(app))
-    , mErrorRead(
-          app.getMetrics().NewMeter({"overlay", "error", "read"}, "error"))
-    , mErrorWrite(
-          app.getMetrics().NewMeter({"overlay", "error", "write"}, "error"))
-    , mTimeoutIdle(
-          app.getMetrics().NewMeter({"overlay", "timeout", "idle"}, "timeout"))
-    , mTimeoutStraggler(app.getMetrics().NewMeter(
-          {"overlay", "timeout", "straggler"}, "timeout"))
-
-    , mRecvErrorTimer(app.getMetrics().NewTimer({"overlay", "recv", "error"}))
-    , mRecvHelloTimer(app.getMetrics().NewTimer({"overlay", "recv", "hello"}))
-    , mRecvAuthTimer(app.getMetrics().NewTimer({"overlay", "recv", "auth"}))
-    , mRecvDontHaveTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "dont-have"}))
-    , mRecvGetPeersTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "get-peers"}))
-    , mRecvPeersTimer(app.getMetrics().NewTimer({"overlay", "recv", "peers"}))
-    , mRecvGetTxSetTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "get-txset"}))
-    , mRecvTxSetTimer(app.getMetrics().NewTimer({"overlay", "recv", "txset"}))
-    , mRecvTransactionTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "transaction"}))
-    , mRecvGetSCPQuorumSetTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "get-scp-qset"}))
-    , mRecvSCPQuorumSetTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "scp-qset"}))
-    , mRecvSCPMessageTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "scp-message"}))
-    , mRecvGetSCPStateTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "get-scp-state"}))
-
-    , mRecvSCPPrepareTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "scp-prepare"}))
-    , mRecvSCPConfirmTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "scp-confirm"}))
-    , mRecvSCPNominateTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "scp-nominate"}))
-    , mRecvSCPExternalizeTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "scp-externalize"}))
-
-    , mSendErrorMeter(
-          app.getMetrics().NewMeter({"overlay", "send", "error"}, "message"))
-    , mSendHelloMeter(
-          app.getMetrics().NewMeter({"overlay", "send", "hello"}, "message"))
-    , mSendAuthMeter(
-          app.getMetrics().NewMeter({"overlay", "send", "auth"}, "message"))
-    , mSendDontHaveMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "dont-have"}, "message"))
-    , mSendGetPeersMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "get-peers"}, "message"))
-    , mSendPeersMeter(
-          app.getMetrics().NewMeter({"overlay", "send", "peers"}, "message"))
-    , mSendGetTxSetMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "get-txset"}, "message"))
-    , mSendTransactionMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "transaction"}, "message"))
-    , mSendTxSetMeter(
-          app.getMetrics().NewMeter({"overlay", "send", "txset"}, "message"))
-    , mSendGetSCPQuorumSetMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "get-scp-qset"}, "message"))
-    , mSendSCPQuorumSetMeter(
-          app.getMetrics().NewMeter({"overlay", "send", "scp-qset"}, "message"))
-    , mSendSCPMessageSetMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "scp-message"}, "message"))
-    , mSendGetSCPStateMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "get-scp-state"}, "message"))
+    , mEnqueueTimeOfLastWrite(app.getClock().now())
+    , mPeerMetrics(app.getClock().now())
 {
+    mPingSentTime = PING_NOT_SENT;
+    mLastPing = std::chrono::hours(24); // some default very high value
     auto bytes = randomBytes(mSendNonce.size());
     std::copy(bytes.begin(), bytes.end(), mSendNonce.begin());
 }
@@ -142,7 +68,8 @@ Peer::Peer(Application& app, PeerRole role)
 void
 Peer::sendHello()
 {
-    CLOG(DEBUG, "Overlay") << "Peer::sendHello to " << toString();
+    CLOG(DEBUG, "Overlay") << "Peer::sendHello to " << toString() << " @"
+                           << mApp.getConfig().PEER_PORT;
     StellarMessage msg;
     msg.type(HELLO);
     Hello& elo = msg.hello();
@@ -162,6 +89,12 @@ AuthCert
 Peer::getAuthCert()
 {
     return mApp.getOverlayManager().getPeerAuth().getAuthCert();
+}
+
+OverlayMetrics&
+Peer::getOverlayMetrics()
+{
+    return mApp.getOverlayManager().getOverlayMetrics();
 }
 
 std::chrono::seconds
@@ -193,27 +126,35 @@ Peer::receivedBytes(size_t byteCount, bool gotFullMessage)
     LoadManager::PeerContext loadCtx(mApp, mPeerID);
     mLastRead = mApp.getClock().now();
     if (gotFullMessage)
-        mMessageRead.Mark();
-    mByteRead.Mark(byteCount);
+    {
+        getOverlayMetrics().mMessageRead.Mark();
+        ++mPeerMetrics.mMessageRead;
+    }
+    getOverlayMetrics().mByteRead.Mark(byteCount);
+    mPeerMetrics.mByteRead += byteCount;
 }
 
 void
-Peer::startIdleTimer()
+Peer::startRecurrentTimer()
 {
+    constexpr std::chrono::seconds RECURRENT_TIMER_PERIOD(5);
+
     if (shouldAbort())
     {
         return;
     }
 
+    pingPeer();
+
     auto self = shared_from_this();
-    mIdleTimer.expires_from_now(getIOTimeout());
-    mIdleTimer.async_wait([self](asio::error_code const& error) {
-        self->idleTimerExpired(error);
+    mRecurringTimer.expires_from_now(RECURRENT_TIMER_PERIOD);
+    mRecurringTimer.async_wait([self](asio::error_code const& error) {
+        self->recurrentTimerExpired(error);
     });
 }
 
 void
-Peer::idleTimerExpired(asio::error_code const& error)
+Peer::recurrentTimerExpired(asio::error_code const& error)
 {
     if (!error)
     {
@@ -223,20 +164,20 @@ Peer::idleTimerExpired(asio::error_code const& error)
             std::chrono::seconds(mApp.getConfig().PEER_STRAGGLER_TIMEOUT);
         if (((now - mLastRead) >= timeout) && ((now - mLastWrite) >= timeout))
         {
-            mTimeoutIdle.Mark();
+            getOverlayMetrics().mTimeoutIdle.Mark();
             drop("idle timeout", Peer::DropDirection::WE_DROPPED_REMOTE,
                  Peer::DropMode::IGNORE_WRITE_QUEUE);
         }
-        else if (((now - mLastEmpty) >= stragglerTimeout))
+        else if (((now - mEnqueueTimeOfLastWrite) >= stragglerTimeout))
         {
-            mTimeoutStraggler.Mark();
+            getOverlayMetrics().mTimeoutStraggler.Mark();
             drop("straggling (cannot keep up)",
                  Peer::DropDirection::WE_DROPPED_REMOTE,
                  Peer::DropMode::IGNORE_WRITE_QUEUE);
         }
         else
         {
-            startIdleTimer();
+            startRecurrentTimer();
         }
     }
 }
@@ -266,7 +207,8 @@ Peer::connectHandler(asio::error_code const& error)
     }
     else
     {
-        CLOG(DEBUG, "Overlay") << "Connected to " << toString();
+        CLOG(DEBUG, "Overlay") << "Connected to " << toString() << " @"
+                               << mApp.getConfig().PEER_PORT;
         connected();
         mState = CONNECTED;
         sendHello();
@@ -307,9 +249,6 @@ Peer::sendGetTxSet(uint256 const& setID)
 void
 Peer::sendGetQuorumSet(uint256 const& setID)
 {
-    if (Logging::logTrace("Overlay"))
-        CLOG(TRACE, "Overlay") << "Get quorum set: " << hexAbbrev(setID);
-
     StellarMessage newMsg;
     newMsg.type(GET_SCP_QUORUMSET);
     newMsg.qSetHash() = setID;
@@ -320,8 +259,6 @@ Peer::sendGetQuorumSet(uint256 const& setID)
 void
 Peer::sendGetPeers()
 {
-    CLOG(TRACE, "Overlay") << "Get peers";
-
     StellarMessage newMsg;
     newMsg.type(GET_PEERS);
 
@@ -331,8 +268,6 @@ Peer::sendGetPeers()
 void
 Peer::sendGetScpState(uint32 ledgerSeq)
 {
-    CLOG(TRACE, "Overlay") << "Get SCP State for " << ledgerSeq;
-
     StellarMessage newMsg;
     newMsg.type(GET_SCP_STATE);
     newMsg.getSCPLedgerSeq() = ledgerSeq;
@@ -352,12 +287,15 @@ Peer::sendPeers()
         maxPeerCount, mAddress);
     assert(peers.size() <= maxPeerCount);
 
-    newMsg.peers().reserve(peers.size());
-    for (auto const& address : peers)
+    if (!peers.empty())
     {
-        newMsg.peers().push_back(toXdr(address));
+        newMsg.peers().reserve(peers.size());
+        for (auto const& address : peers)
+        {
+            newMsg.peers().push_back(toXdr(address));
+        }
+        sendMessage(newMsg);
     }
-    sendMessage(newMsg);
 }
 
 void
@@ -378,8 +316,8 @@ Peer::sendErrorAndDrop(ErrorCode error, std::string const& message,
     drop(message, DropDirection::WE_DROPPED_REMOTE, dropMode);
 }
 
-static std::string
-msgSummary(StellarMessage const& msg)
+std::string
+Peer::msgSummary(StellarMessage const& msg)
 {
     switch (msg.type())
     {
@@ -390,14 +328,15 @@ msgSummary(StellarMessage const& msg)
     case AUTH:
         return "AUTH";
     case DONT_HAVE:
-        return "DONTHAVE";
+        return fmt::format("DONTHAVE {}:{}", msg.dontHave().type,
+                           hexAbbrev(msg.dontHave().reqHash));
     case GET_PEERS:
         return "GETPEERS";
     case PEERS:
-        return "PEERS";
+        return fmt::format("PEERS {}", msg.peers().size());
 
     case GET_TX_SET:
-        return "GETTXSET";
+        return fmt::format("GETTXSET {}", hexAbbrev(msg.txSetHash()));
     case TX_SET:
         return "TXSET";
 
@@ -405,78 +344,100 @@ msgSummary(StellarMessage const& msg)
         return "TRANSACTION";
 
     case GET_SCP_QUORUMSET:
-        return "GET_SCP_QSET";
+        return fmt::format("GET_SCP_QSET {}", hexAbbrev(msg.qSetHash()));
     case SCP_QUORUMSET:
         return "SCP_QSET";
     case SCP_MESSAGE:
+    {
+        std::string t;
         switch (msg.envelope().statement.pledges.type())
         {
         case SCP_ST_PREPARE:
-            return "SCP::PREPARE";
+            t = "SCP::PREPARE";
+            break;
         case SCP_ST_CONFIRM:
-            return "SCP::CONFIRM";
+            t = "SCP::CONFIRM";
+            break;
         case SCP_ST_EXTERNALIZE:
-            return "SCP::EXTERNALIZE";
+            t = "SCP::EXTERNALIZE";
+            break;
         case SCP_ST_NOMINATE:
-            return "SCP::NOMINATE";
+            t = "SCP::NOMINATE";
+            break;
+        default:
+            t = "unknown";
         }
+        return fmt::format(
+            "{} ({})", t,
+            mApp.getConfig().toShortString(msg.envelope().statement.nodeID));
+    }
     case GET_SCP_STATE:
-        return "GET_SCP_STATE";
+        return fmt::format("GET_SCP_STATE {}", msg.getSCPLedgerSeq());
+
+    case SURVEY_REQUEST:
+    case SURVEY_RESPONSE:
+        return SurveyManager::getMsgSummary(msg);
     }
     return "UNKNOWN";
 }
 
 void
-Peer::sendMessage(StellarMessage const& msg)
+Peer::sendMessage(StellarMessage const& msg, bool log)
 {
-    if (Logging::logTrace("Overlay"))
+    if (log && Logging::logTrace("Overlay"))
+    {
         CLOG(TRACE, "Overlay")
-            << "("
-            << mApp.getConfig().toShortString(
-                   mApp.getConfig().NODE_SEED.getPublicKey())
-            << ") send: " << msgSummary(msg)
-            << " to : " << mApp.getConfig().toShortString(mPeerID);
+            << "send: " << msgSummary(msg)
+            << " to : " << mApp.getConfig().toShortString(mPeerID) << " @"
+            << mApp.getConfig().PEER_PORT;
+    }
 
     switch (msg.type())
     {
     case ERROR_MSG:
-        mSendErrorMeter.Mark();
+        getOverlayMetrics().mSendErrorMeter.Mark();
         break;
     case HELLO:
-        mSendHelloMeter.Mark();
+        getOverlayMetrics().mSendHelloMeter.Mark();
         break;
     case AUTH:
-        mSendAuthMeter.Mark();
+        getOverlayMetrics().mSendAuthMeter.Mark();
         break;
     case DONT_HAVE:
-        mSendDontHaveMeter.Mark();
+        getOverlayMetrics().mSendDontHaveMeter.Mark();
         break;
     case GET_PEERS:
-        mSendGetPeersMeter.Mark();
+        getOverlayMetrics().mSendGetPeersMeter.Mark();
         break;
     case PEERS:
-        mSendPeersMeter.Mark();
+        getOverlayMetrics().mSendPeersMeter.Mark();
         break;
     case GET_TX_SET:
-        mSendGetTxSetMeter.Mark();
+        getOverlayMetrics().mSendGetTxSetMeter.Mark();
         break;
     case TX_SET:
-        mSendTxSetMeter.Mark();
+        getOverlayMetrics().mSendTxSetMeter.Mark();
         break;
     case TRANSACTION:
-        mSendTransactionMeter.Mark();
+        getOverlayMetrics().mSendTransactionMeter.Mark();
         break;
     case GET_SCP_QUORUMSET:
-        mSendGetSCPQuorumSetMeter.Mark();
+        getOverlayMetrics().mSendGetSCPQuorumSetMeter.Mark();
         break;
     case SCP_QUORUMSET:
-        mSendSCPQuorumSetMeter.Mark();
+        getOverlayMetrics().mSendSCPQuorumSetMeter.Mark();
         break;
     case SCP_MESSAGE:
-        mSendSCPMessageSetMeter.Mark();
+        getOverlayMetrics().mSendSCPMessageSetMeter.Mark();
         break;
     case GET_SCP_STATE:
-        mSendGetSCPStateMeter.Mark();
+        getOverlayMetrics().mSendGetSCPStateMeter.Mark();
+        break;
+    case SURVEY_REQUEST:
+        getOverlayMetrics().mSendSurveyRequestMeter.Mark();
+        break;
+    case SURVEY_RESPONSE:
+        getOverlayMetrics().mSendSurveyResponseMeter.Mark();
         break;
     };
 
@@ -503,7 +464,6 @@ Peer::recvMessage(xdr::msg_ptr const& msg)
 
     LoadManager::PeerContext loadCtx(mApp, mPeerID);
 
-    CLOG(TRACE, "Overlay") << "received xdr::msg_ptr";
     try
     {
         AuthenticatedMessage am;
@@ -530,6 +490,13 @@ bool
 Peer::isAuthenticated() const
 {
     return mState == GOT_AUTH;
+}
+
+std::chrono::seconds
+Peer::getLifeTime() const
+{
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        mApp.getClock().now() - mCreationTime);
 }
 
 bool
@@ -578,13 +545,77 @@ Peer::recvMessage(StellarMessage const& stellarMsg)
         return;
     }
 
-    if (Logging::logTrace("Overlay"))
-        CLOG(TRACE, "Overlay")
-            << "("
-            << mApp.getConfig().toShortString(
-                   mApp.getConfig().NODE_SEED.getPublicKey())
-            << ") recv: " << msgSummary(stellarMsg)
-            << " from:" << mApp.getConfig().toShortString(mPeerID);
+    std::string cat;
+    VirtualClock::ExecutionCategory::Type catType =
+        VirtualClock::ExecutionCategory::Type::NORMAL_EVENT;
+    switch (stellarMsg.type())
+    {
+    // group messages used during handshake, process those synchronously
+    case MessageType::HELLO:
+    case MessageType::AUTH:
+        Peer::recvRawMessage(stellarMsg);
+        return;
+
+    // control messages
+    case GET_PEERS:
+    case PEERS:
+    case ERROR_MSG:
+        cat = "CTRL";
+        break;
+
+    // high volume flooding
+    case TRANSACTION:
+        cat = "TX";
+        catType = VirtualClock::ExecutionCategory::Type::DROPPABLE_EVENT;
+        break;
+
+    // consensus, inbound
+    case GET_TX_SET:
+    case GET_SCP_QUORUMSET:
+    case GET_SCP_STATE:
+        cat = "SCPQ";
+        catType = VirtualClock::ExecutionCategory::Type::DROPPABLE_EVENT;
+        break;
+
+    // consensus, self
+    case DONT_HAVE:
+    case TX_SET:
+    case SCP_QUORUMSET:
+    case SCP_MESSAGE:
+        cat = "SCP";
+        break;
+
+    default:
+        cat = "MISC";
+    }
+
+    std::weak_ptr<Peer> weak(static_pointer_cast<Peer>(shared_from_this()));
+    std::string err =
+        fmt::format("Error RecvMessage T:{} cat:{} {} @{}", stellarMsg.type(),
+                    cat, toString(), mApp.getConfig().PEER_PORT);
+
+    mApp.postOnMainThread(
+        [ err, weak, sm = StellarMessage(stellarMsg) ]() {
+            auto self = weak.lock();
+            if (self)
+            {
+                self->recvRawMessage(sm);
+            }
+            else
+            {
+                CLOG(TRACE, "Overlay") << err;
+            }
+        },
+        {catType, fmt::format("{}-{} recvMessage", cat, toString())});
+}
+
+void
+Peer::recvRawMessage(StellarMessage const& stellarMsg)
+{
+    if (shouldAbort())
+    {
+        return;
+    }
 
     if (!isAuthenticated() && (stellarMsg.type() != HELLO) &&
         (stellarMsg.type() != AUTH) && (stellarMsg.type() != ERROR_MSG))
@@ -598,96 +629,112 @@ Peer::recvMessage(StellarMessage const& stellarMsg)
 
     assert(isAuthenticated() || stellarMsg.type() == HELLO ||
            stellarMsg.type() == AUTH || stellarMsg.type() == ERROR_MSG);
+    mApp.getOverlayManager().recordMessageMetric(stellarMsg,
+                                                 shared_from_this());
 
     switch (stellarMsg.type())
     {
     case ERROR_MSG:
     {
-        auto t = mRecvErrorTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvErrorTimer.TimeScope();
         recvError(stellarMsg);
     }
     break;
 
     case HELLO:
     {
-        auto t = mRecvHelloTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvHelloTimer.TimeScope();
         this->recvHello(stellarMsg.hello());
     }
     break;
 
     case AUTH:
     {
-        auto t = mRecvAuthTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvAuthTimer.TimeScope();
         this->recvAuth(stellarMsg);
     }
     break;
 
     case DONT_HAVE:
     {
-        auto t = mRecvDontHaveTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvDontHaveTimer.TimeScope();
         recvDontHave(stellarMsg);
     }
     break;
 
     case GET_PEERS:
     {
-        auto t = mRecvGetPeersTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvGetPeersTimer.TimeScope();
         recvGetPeers(stellarMsg);
     }
     break;
 
     case PEERS:
     {
-        auto t = mRecvPeersTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvPeersTimer.TimeScope();
         recvPeers(stellarMsg);
+    }
+    break;
+
+    case SURVEY_REQUEST:
+    {
+        auto t = getOverlayMetrics().mRecvSurveyRequestTimer.TimeScope();
+        recvSurveyRequestMessage(stellarMsg);
+    }
+    break;
+
+    case SURVEY_RESPONSE:
+    {
+        auto t = getOverlayMetrics().mRecvSurveyResponseTimer.TimeScope();
+        recvSurveyResponseMessage(stellarMsg);
     }
     break;
 
     case GET_TX_SET:
     {
-        auto t = mRecvGetTxSetTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvGetTxSetTimer.TimeScope();
         recvGetTxSet(stellarMsg);
     }
     break;
 
     case TX_SET:
     {
-        auto t = mRecvTxSetTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvTxSetTimer.TimeScope();
         recvTxSet(stellarMsg);
     }
     break;
 
     case TRANSACTION:
     {
-        auto t = mRecvTransactionTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvTransactionTimer.TimeScope();
         recvTransaction(stellarMsg);
     }
     break;
 
     case GET_SCP_QUORUMSET:
     {
-        auto t = mRecvGetSCPQuorumSetTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvGetSCPQuorumSetTimer.TimeScope();
         recvGetSCPQuorumSet(stellarMsg);
     }
     break;
 
     case SCP_QUORUMSET:
     {
-        auto t = mRecvSCPQuorumSetTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvSCPQuorumSetTimer.TimeScope();
         recvSCPQuorumSet(stellarMsg);
     }
     break;
 
     case SCP_MESSAGE:
     {
-        auto t = mRecvSCPMessageTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvSCPMessageTimer.TimeScope();
         recvSCPMessage(stellarMsg);
     }
     break;
 
     case GET_SCP_STATE:
     {
-        auto t = mRecvGetSCPStateTimer.TimeScope();
+        auto t = getOverlayMetrics().mRecvGetSCPStateTimer.TimeScope();
         recvGetSCPState(stellarMsg);
     }
     break;
@@ -697,6 +744,8 @@ Peer::recvMessage(StellarMessage const& stellarMsg)
 void
 Peer::recvDontHave(StellarMessage const& msg)
 {
+    maybeProcessPingResponse(msg.dontHave().reqHash);
+
     mApp.getHerder().peerDoesntHave(msg.dontHave().type, msg.dontHave().reqHash,
                                     shared_from_this());
 }
@@ -729,7 +778,7 @@ Peer::recvTxSet(StellarMessage const& msg)
 void
 Peer::recvTransaction(StellarMessage const& msg)
 {
-    TransactionFramePtr transaction = TransactionFrame::makeTransactionFromWire(
+    auto transaction = TransactionFrameBase::makeTransactionFromWire(
         mApp.getNetworkID(), msg.transaction());
     if (transaction)
     {
@@ -752,9 +801,58 @@ Peer::recvTransaction(StellarMessage const& msg)
     }
 }
 
+Hash
+Peer::pingIDfromTimePoint(VirtualClock::time_point const& tp)
+{
+    auto sh = shortHash::xdrComputeHash(
+        xdr::xdr_to_opaque(uint64_t(tp.time_since_epoch().count())));
+    Hash res;
+    assert(res.size() >= sizeof(sh));
+    std::memcpy(res.data(), &sh, sizeof(sh));
+    return res;
+}
+
+void
+Peer::pingPeer()
+{
+    if (!mApp.getConfig().RUN_STANDALONE && isAuthenticated() &&
+        mPingSentTime == PING_NOT_SENT)
+    {
+        mPingSentTime = mApp.getClock().now();
+        auto h = pingIDfromTimePoint(mPingSentTime);
+        sendGetQuorumSet(h);
+    }
+}
+
+void
+Peer::maybeProcessPingResponse(Hash const& id)
+{
+    if (mPingSentTime != PING_NOT_SENT)
+    {
+        auto h = pingIDfromTimePoint(mPingSentTime);
+        if (h == id)
+        {
+            mLastPing = std::chrono::duration_cast<std::chrono::milliseconds>(
+                mApp.getClock().now() - mPingSentTime);
+            mPingSentTime = PING_NOT_SENT;
+            CLOG(DEBUG, "Overlay") << fmt::format(
+                "Latency {}: {} ms", toString(), mLastPing.count());
+            getOverlayMetrics().mConnectionLatencyTimer.Update(mLastPing);
+        }
+    }
+}
+
+std::chrono::milliseconds
+Peer::getPing() const
+{
+    return mLastPing;
+}
+
 void
 Peer::recvGetSCPQuorumSet(StellarMessage const& msg)
 {
+    maybeProcessPingResponse(msg.qSetHash());
+
     SCPQuorumSetPtr qset = mApp.getHerder().getQSet(msg.qSetHash());
 
     if (qset)
@@ -781,24 +879,27 @@ void
 Peer::recvSCPMessage(StellarMessage const& msg)
 {
     SCPEnvelope const& envelope = msg.envelope();
-    if (Logging::logTrace("Overlay"))
-        CLOG(TRACE, "Overlay")
-            << "recvSCPMessage node: "
-            << mApp.getConfig().toShortString(msg.envelope().statement.nodeID);
 
     auto type = msg.envelope().statement.pledges.type();
     auto t = (type == SCP_ST_PREPARE
-                  ? mRecvSCPPrepareTimer.TimeScope()
+                  ? getOverlayMetrics().mRecvSCPPrepareTimer.TimeScope()
                   : (type == SCP_ST_CONFIRM
-                         ? mRecvSCPConfirmTimer.TimeScope()
+                         ? getOverlayMetrics().mRecvSCPConfirmTimer.TimeScope()
                          : (type == SCP_ST_EXTERNALIZE
-                                ? mRecvSCPExternalizeTimer.TimeScope()
-                                : (mRecvSCPNominateTimer.TimeScope()))));
+                                ? getOverlayMetrics()
+                                      .mRecvSCPExternalizeTimer.TimeScope()
+                                : (getOverlayMetrics()
+                                       .mRecvSCPNominateTimer.TimeScope()))));
+
+    // add it to the floodmap so that this peer gets credit for it
+    Hash msgID;
+    mApp.getOverlayManager().recvFloodedMsgID(msg, shared_from_this(), msgID);
 
     auto res = mApp.getHerder().recvSCPEnvelope(envelope);
-    if (res != Herder::ENVELOPE_STATUS_DISCARDED)
+    if (res == Herder::ENVELOPE_STATUS_DISCARDED)
     {
-        mApp.getOverlayManager().recvFloodedMsg(msg, shared_from_this());
+        // the message was discarded, remove it from the floodmap as well
+        mApp.getOverlayManager().forgetFloodedMsg(msgID);
     }
 }
 
@@ -806,7 +907,6 @@ void
 Peer::recvGetSCPState(StellarMessage const& msg)
 {
     uint32 seq = msg.getSCPLedgerSeq();
-    CLOG(TRACE, "Overlay") << "get SCP State " << seq;
     mApp.getHerder().sendSCPStateToPeer(seq, shared_from_this());
 }
 
@@ -908,7 +1008,13 @@ Peer::recvHello(Hello const& elo)
                                               mRecvNonce, mRole);
 
     mState = GOT_HELLO;
-    CLOG(DEBUG, "Overlay") << "recvHello from " << toString();
+
+    auto ip = getIP();
+    mAddress =
+        PeerBareAddress{ip, static_cast<unsigned short>(elo.listeningPort)};
+
+    CLOG(DEBUG, "Overlay") << "recvHello from " << toString() << " @"
+                           << mApp.getConfig().PEER_PORT;
 
     auto dropMode = Peer::DropMode::IGNORE_WRITE_QUEUE;
     if (mRole == REMOTE_CALLED_US)
@@ -954,7 +1060,6 @@ Peer::recvHello(Hello const& elo)
         return;
     }
 
-    auto ip = getIP();
     if (elo.listeningPort <= 0 || elo.listeningPort > UINT16_MAX || ip.empty())
     {
         sendErrorAndDrop(ERR_CONF, "bad address",
@@ -962,8 +1067,6 @@ Peer::recvHello(Hello const& elo)
         return;
     }
 
-    mAddress =
-        PeerBareAddress{ip, static_cast<unsigned short>(elo.listeningPort)};
     updatePeerRecordAfterEcho();
 
     auto const& authenticated =
@@ -1044,9 +1147,10 @@ Peer::recvAuth(StellarMessage const& msg)
     // possible) we need to ask for older slots in case other peers need
     // messages we didn't need ourself
     auto low = mApp.getLedgerManager().getLastClosedLedgerNum() + 1;
-    if (low > Herder::MAX_SLOTS_TO_REMEMBER)
+    auto maxSlots = mApp.getConfig().MAX_SLOTS_TO_REMEMBER;
+    if (low > maxSlots)
     {
-        low -= Herder::MAX_SLOTS_TO_REMEMBER;
+        low -= maxSlots;
     }
     else
     {
@@ -1105,5 +1209,36 @@ Peer::recvPeers(StellarMessage const& msg)
             mApp.getOverlayManager().getPeerManager().ensureExists(address);
         }
     }
+}
+
+void
+Peer::recvSurveyRequestMessage(StellarMessage const& msg)
+{
+    mApp.getOverlayManager().getSurveyManager().relayOrProcessRequest(
+        msg, shared_from_this());
+}
+
+void
+Peer::recvSurveyResponseMessage(StellarMessage const& msg)
+{
+    mApp.getOverlayManager().getSurveyManager().relayOrProcessResponse(
+        msg, shared_from_this());
+}
+
+Peer::PeerMetrics::PeerMetrics(VirtualClock::time_point connectedTime)
+    : mMessageRead(0)
+    , mMessageWrite(0)
+    , mByteRead(0)
+    , mByteWrite(0)
+    , mUniqueFloodBytesRecv(0)
+    , mDuplicateFloodBytesRecv(0)
+    , mUniqueFetchBytesRecv(0)
+    , mDuplicateFetchBytesRecv(0)
+    , mUniqueFloodMessageRecv(0)
+    , mDuplicateFloodMessageRecv(0)
+    , mUniqueFetchMessageRecv(0)
+    , mDuplicateFetchMessageRecv(0)
+    , mConnectedTime(connectedTime)
+{
 }
 }

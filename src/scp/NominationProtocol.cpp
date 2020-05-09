@@ -14,6 +14,7 @@
 #include "util/Logging.h"
 #include "util/XDROperators.h"
 #include "xdrpp/marshal.h"
+#include <algorithm>
 #include <functional>
 
 namespace stellar
@@ -38,7 +39,8 @@ NominationProtocol::isNewerStatement(NodeID const& nodeID,
     }
     else
     {
-        res = isNewerStatement(oldp->second.statement.pledges.nominate(), st);
+        res = isNewerStatement(oldp->second->getStatement().pledges.nominate(),
+                               st);
     }
     return res;
 }
@@ -74,7 +76,7 @@ NominationProtocol::validateValue(Value const& v)
     return mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(), v, true);
 }
 
-Value
+ValueWrapperPtr
 NominationProtocol::extractValidValue(Value const& value)
 {
     return mSlot.getSCPDriver().extractValidValue(mSlot.getSlotIndex(), value);
@@ -124,9 +126,9 @@ NominationProtocol::isSane(SCPStatement const& st)
 // only called after a call to isNewerStatement so safe to replace the
 // mLatestNomination
 void
-NominationProtocol::recordEnvelope(SCPEnvelope const& env)
+NominationProtocol::recordEnvelope(SCPEnvelopeWrapperPtr env)
 {
-    auto const& st = env.statement;
+    auto const& st = env->getStatement();
     auto oldp = mLatestNominations.find(st.nodeID);
     if (oldp == mLatestNominations.end())
     {
@@ -136,7 +138,7 @@ NominationProtocol::recordEnvelope(SCPEnvelope const& env)
     {
         oldp->second = env;
     }
-    mSlot.recordStatement(env.statement);
+    mSlot.recordStatement(env->getStatement());
 }
 
 void
@@ -151,22 +153,24 @@ NominationProtocol::emitNomination()
 
     for (auto const& v : mVotes)
     {
-        nom.votes.emplace_back(v);
+        nom.votes.emplace_back(v->getValue());
     }
     for (auto const& a : mAccepted)
     {
-        nom.accepted.emplace_back(a);
+        nom.accepted.emplace_back(a->getValue());
     }
 
     SCPEnvelope envelope = mSlot.createEnvelope(st);
 
-    if (mSlot.processEnvelope(envelope, true) == SCP::EnvelopeState::VALID)
+    auto envW = mSlot.getSCPDriver().wrapEnvelope(envelope);
+
+    if (mSlot.processEnvelope(envW, true) == SCP::EnvelopeState::VALID)
     {
         if (!mLastEnvelope ||
-            isNewerStatement(mLastEnvelope->statement.pledges.nominate(),
+            isNewerStatement(mLastEnvelope->getStatement().pledges.nominate(),
                              st.pledges.nominate()))
         {
-            mLastEnvelope = std::make_unique<SCPEnvelope>(envelope);
+            mLastEnvelope = envW;
             if (mSlot.isFullyValidated())
             {
                 mSlot.getSCPDriver().emitEnvelope(envelope);
@@ -199,9 +203,13 @@ NominationProtocol::applyAll(SCPNomination const& nom,
     {
         processor(v);
     }
+    // NB: "accepted" should be a subset of "votes", so this should no-op
     for (auto const& a : nom.accepted)
     {
-        processor(a);
+        if (std::find(nom.votes.begin(), nom.votes.end(), a) == nom.votes.end())
+        {
+            processor(a);
+        }
     }
 }
 
@@ -290,30 +298,30 @@ NominationProtocol::getNodePriority(NodeID const& nodeID,
     return res;
 }
 
-Value
+ValueWrapperPtr
 NominationProtocol::getNewValueFromNomination(SCPNomination const& nom)
 {
     // pick the highest value we don't have from the leader
     // sorted using hashValue.
-    Value newVote;
+    ValueWrapperPtr newVote;
     uint64 newHash = 0;
 
     applyAll(nom, [&](Value const& value) {
-        Value valueToNominate;
+        ValueWrapperPtr valueToNominate;
         auto vl = validateValue(value);
         if (vl == SCPDriver::kFullyValidatedValue)
         {
-            valueToNominate = value;
+            valueToNominate = mSlot.getSCPDriver().wrapValue(value);
         }
         else
         {
             valueToNominate = extractValidValue(value);
         }
-        if (!valueToNominate.empty())
+        if (valueToNominate)
         {
             if (mVotes.find(valueToNominate) == mVotes.end())
             {
-                uint64 curHash = hashValue(valueToNominate);
+                uint64 curHash = hashValue(valueToNominate->getValue());
                 if (curHash >= newHash)
                 {
                     newHash = curHash;
@@ -326,127 +334,120 @@ NominationProtocol::getNewValueFromNomination(SCPNomination const& nom)
 }
 
 SCP::EnvelopeState
-NominationProtocol::processEnvelope(SCPEnvelope const& envelope)
+NominationProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope)
 {
-    auto const& st = envelope.statement;
+    auto const& st = envelope->getStatement();
     auto const& nom = st.pledges.nominate();
 
-    SCP::EnvelopeState res = SCP::EnvelopeState::INVALID;
+    if (!isNewerStatement(st.nodeID, nom))
+        return SCP::EnvelopeState::INVALID;
 
-    if (isNewerStatement(st.nodeID, nom))
+    if (!isSane(st))
     {
-        if (isSane(st))
+        CLOG(TRACE, "SCP")
+            << "NominationProtocol: message didn't pass sanity check";
+        return SCP::EnvelopeState::INVALID;
+    }
+
+    recordEnvelope(envelope);
+
+    if (mNominationStarted)
+    {
+        // tracks if we should emit a new nomination message
+        bool modified = false;
+        bool newCandidates = false;
+
+        // attempts to promote some of the votes to accepted
+        for (auto const& v : nom.votes)
         {
-            recordEnvelope(envelope);
-            res = SCP::EnvelopeState::VALID;
-
-            if (mNominationStarted)
+            auto vw = mSlot.getSCPDriver().wrapValue(v);
+            if (mAccepted.find(vw) != mAccepted.end())
+            { // v is already accepted
+                continue;
+            }
+            if (mSlot.federatedAccept(
+                    [&v](SCPStatement const& st) -> bool {
+                        auto const& nom = st.pledges.nominate();
+                        bool res;
+                        res = (std::find(nom.votes.begin(), nom.votes.end(),
+                                         v) != nom.votes.end());
+                        return res;
+                    },
+                    std::bind(&NominationProtocol::acceptPredicate, v, _1),
+                    mLatestNominations))
             {
-                bool modified =
-                    false; // tracks if we should emit a new nomination message
-                bool newCandidates = false;
-
-                // attempts to promote some of the votes to accepted
-                for (auto const& v : nom.votes)
+                auto vl = validateValue(v);
+                if (vl == SCPDriver::kFullyValidatedValue)
                 {
-                    if (mAccepted.find(v) != mAccepted.end())
-                    { // v is already accepted
-                        continue;
-                    }
-                    if (mSlot.federatedAccept(
-                            [&v](SCPStatement const& st) -> bool {
-                                auto const& nom = st.pledges.nominate();
-                                bool res;
-                                res = (std::find(nom.votes.begin(),
-                                                 nom.votes.end(),
-                                                 v) != nom.votes.end());
-                                return res;
-                            },
-                            std::bind(&NominationProtocol::acceptPredicate, v,
-                                      _1),
-                            mLatestNominations))
+                    mAccepted.emplace(vw);
+                    mVotes.emplace(vw);
+                    modified = true;
+                }
+                else
+                {
+                    // the value made it pretty far:
+                    // see if we can vote for a variation that
+                    // we consider valid
+                    auto toVote = extractValidValue(v);
+                    if (toVote)
                     {
-                        auto vl = validateValue(v);
-                        if (vl == SCPDriver::kFullyValidatedValue)
+                        if (mVotes.emplace(toVote).second)
                         {
-                            mAccepted.emplace(v);
-                            mVotes.emplace(v);
                             modified = true;
                         }
-                        else
-                        {
-                            // the value made it pretty far:
-                            // see if we can vote for a variation that
-                            // we consider valid
-                            Value toVote;
-                            toVote = extractValidValue(v);
-                            if (!toVote.empty())
-                            {
-                                if (mVotes.emplace(toVote).second)
-                                {
-                                    modified = true;
-                                }
-                            }
-                        }
                     }
-                }
-                // attempts to promote accepted values to candidates
-                for (auto const& a : mAccepted)
-                {
-                    if (mCandidates.find(a) != mCandidates.end())
-                    {
-                        continue;
-                    }
-                    if (mSlot.federatedRatify(
-                            std::bind(&NominationProtocol::acceptPredicate, a,
-                                      _1),
-                            mLatestNominations))
-                    {
-                        mCandidates.emplace(a);
-                        newCandidates = true;
-                    }
-                }
-
-                // only take round leader votes if we're still looking for
-                // candidates
-                if (mCandidates.empty() &&
-                    mRoundLeaders.find(st.nodeID) != mRoundLeaders.end())
-                {
-                    Value newVote = getNewValueFromNomination(nom);
-                    if (!newVote.empty())
-                    {
-                        mVotes.emplace(newVote);
-                        modified = true;
-                        mSlot.getSCPDriver().nominatingValue(
-                            mSlot.getSlotIndex(), newVote);
-                    }
-                }
-
-                if (modified)
-                {
-                    emitNomination();
-                }
-
-                if (newCandidates)
-                {
-                    mLatestCompositeCandidate =
-                        mSlot.getSCPDriver().combineCandidates(
-                            mSlot.getSlotIndex(), mCandidates);
-
-                    mSlot.getSCPDriver().updatedCandidateValue(
-                        mSlot.getSlotIndex(), mLatestCompositeCandidate);
-
-                    mSlot.bumpState(mLatestCompositeCandidate, false);
                 }
             }
         }
-        else
+        // attempts to promote accepted values to candidates
+        for (auto const& a : mAccepted)
         {
-            CLOG(TRACE, "SCP")
-                << "NominationProtocol: message didn't pass sanity check";
+            if (mCandidates.find(a) != mCandidates.end())
+            {
+                continue;
+            }
+            if (mSlot.federatedRatify(
+                    std::bind(&NominationProtocol::acceptPredicate,
+                              a->getValue(), _1),
+                    mLatestNominations))
+            {
+                mCandidates.emplace(a);
+                newCandidates = true;
+            }
+        }
+
+        // only take round leader votes if we're still looking for
+        // candidates
+        if (mCandidates.empty() &&
+            mRoundLeaders.find(st.nodeID) != mRoundLeaders.end())
+        {
+            auto newVote = getNewValueFromNomination(nom);
+            if (newVote)
+            {
+                mVotes.emplace(newVote);
+                modified = true;
+                mSlot.getSCPDriver().nominatingValue(mSlot.getSlotIndex(),
+                                                     newVote->getValue());
+            }
+        }
+
+        if (modified)
+        {
+            emitNomination();
+        }
+
+        if (newCandidates)
+        {
+            mLatestCompositeCandidate = mSlot.getSCPDriver().combineCandidates(
+                mSlot.getSlotIndex(), mCandidates);
+
+            mSlot.getSCPDriver().updatedCandidateValue(
+                mSlot.getSlotIndex(), mLatestCompositeCandidate->getValue());
+
+            mSlot.bumpState(mLatestCompositeCandidate->getValue(), false);
         }
     }
-    return res;
+    return SCP::EnvelopeState::VALID;
 }
 
 std::vector<Value>
@@ -460,12 +461,13 @@ NominationProtocol::getStatementValues(SCPStatement const& st)
 
 // attempts to nominate a value for consensus
 bool
-NominationProtocol::nominate(Value const& value, Value const& previousValue,
+NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
                              bool timedout)
 {
     if (Logging::logDebug("SCP"))
         CLOG(DEBUG, "SCP") << "NominationProtocol::nominate (" << mRoundNumber
-                           << ") " << mSlot.getSCP().getValueString(value);
+                           << ") "
+                           << mSlot.getSCP().getValueString(value->getValue());
 
     bool updated = false;
 
@@ -482,7 +484,8 @@ NominationProtocol::nominate(Value const& value, Value const& previousValue,
     mRoundNumber++;
     updateRoundLeaders();
 
-    Value nominatingValue;
+    std::chrono::milliseconds timeout =
+        mSlot.getSCPDriver().computeTimeout(mRoundNumber);
 
     // if we're leader, add our value
     if (mRoundLeaders.find(mSlot.getLocalNode()->getNodeID()) !=
@@ -492,8 +495,9 @@ NominationProtocol::nominate(Value const& value, Value const& previousValue,
         if (ins.second)
         {
             updated = true;
+            mSlot.getSCPDriver().nominatingValue(mSlot.getSlotIndex(),
+                                                 value->getValue());
         }
-        nominatingValue = value;
     }
     // add a few more values from other leaders
     for (auto const& leader : mRoundLeaders)
@@ -501,20 +505,17 @@ NominationProtocol::nominate(Value const& value, Value const& previousValue,
         auto it = mLatestNominations.find(leader);
         if (it != mLatestNominations.end())
         {
-            nominatingValue = getNewValueFromNomination(
-                it->second.statement.pledges.nominate());
-            if (!nominatingValue.empty())
+            auto lnmV = getNewValueFromNomination(
+                it->second->getStatement().pledges.nominate());
+            if (lnmV)
             {
-                mVotes.insert(nominatingValue);
+                mVotes.insert(lnmV);
                 updated = true;
+                mSlot.getSCPDriver().nominatingValue(mSlot.getSlotIndex(),
+                                                     lnmV->getValue());
             }
         }
     }
-
-    std::chrono::milliseconds timeout =
-        mSlot.getSCPDriver().computeTimeout(mRoundNumber);
-
-    mSlot.getSCPDriver().nominatingValue(mSlot.getSlotIndex(), nominatingValue);
 
     std::shared_ptr<Slot> slot = mSlot.shared_from_this();
     mSlot.getSCPDriver().setupTimer(
@@ -557,21 +558,21 @@ NominationProtocol::getJsonInfo()
     int counter = 0;
     for (auto const& v : mVotes)
     {
-        ret["X"][counter] = mSlot.getSCP().getValueString(v);
+        ret["X"][counter] = mSlot.getSCP().getValueString(v->getValue());
         counter++;
     }
 
     counter = 0;
     for (auto const& v : mAccepted)
     {
-        ret["Y"][counter] = mSlot.getSCP().getValueString(v);
+        ret["Y"][counter] = mSlot.getSCP().getValueString(v->getValue());
         counter++;
     }
 
     counter = 0;
     for (auto const& v : mCandidates)
     {
-        ret["Z"][counter] = mSlot.getSCP().getValueString(v);
+        ret["Z"][counter] = mSlot.getSCP().getValueString(v->getValue());
         counter++;
     }
 
@@ -579,7 +580,7 @@ NominationProtocol::getJsonInfo()
 }
 
 void
-NominationProtocol::setStateFromEnvelope(SCPEnvelope const& e)
+NominationProtocol::setStateFromEnvelope(SCPEnvelopeWrapperPtr e)
 {
     if (mNominationStarted)
     {
@@ -587,34 +588,36 @@ NominationProtocol::setStateFromEnvelope(SCPEnvelope const& e)
             "Cannot set state after nomination is started");
     }
     recordEnvelope(e);
-    auto const& nom = e.statement.pledges.nominate();
+    auto const& nom = e->getStatement().pledges.nominate();
     for (auto const& a : nom.accepted)
     {
-        mAccepted.emplace(a);
+        mAccepted.emplace(mSlot.getSCPDriver().wrapValue(a));
     }
     for (auto const& v : nom.votes)
     {
-        mVotes.emplace(v);
+        mVotes.emplace(mSlot.getSCPDriver().wrapValue(v));
     }
 
-    mLastEnvelope = std::make_unique<SCPEnvelope>(e);
+    mLastEnvelope = e;
 }
 
-std::vector<SCPEnvelope>
-NominationProtocol::getCurrentState() const
+bool
+NominationProtocol::processCurrentState(
+    std::function<bool(SCPEnvelope const&)> const& f, bool forceSelf) const
 {
-    std::vector<SCPEnvelope> res;
-    res.reserve(mLatestNominations.size());
     for (auto const& n : mLatestNominations)
     {
         // only return messages for self if the slot is fully validated
-        if (!(n.first == mSlot.getSCP().getLocalNodeID()) ||
+        if (forceSelf || !(n.first == mSlot.getSCP().getLocalNodeID()) ||
             mSlot.isFullyValidated())
         {
-            res.emplace_back(n.second);
+            if (!f(n.second->getEnvelope()))
+            {
+                return false;
+            }
         }
     }
-    return res;
+    return true;
 }
 
 SCPEnvelope const*
@@ -623,7 +626,7 @@ NominationProtocol::getLatestMessage(NodeID const& id) const
     auto it = mLatestNominations.find(id);
     if (it != mLatestNominations.end())
     {
-        return &it->second;
+        return &it->second->getEnvelope();
     }
     return nullptr;
 }

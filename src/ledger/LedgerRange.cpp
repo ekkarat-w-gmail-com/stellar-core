@@ -3,16 +3,23 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "ledger/LedgerRange.h"
+
 #include <cassert>
+#include <util/format.h>
 
 namespace stellar
 {
 
-LedgerRange::LedgerRange(uint32_t first, uint32_t last)
-    : mFirst{first}, mLast{last}
+LedgerRange::LedgerRange(uint32_t first, uint32_t count)
+    : mFirst{first}, mCount{count}
 {
-    assert(mFirst > 0);
-    assert(mLast >= mFirst);
+    assert(count == 0 || mFirst > 0);
+}
+
+std::string
+LedgerRange::toString() const
+{
+    return fmt::format("[{},{})", mFirst, mFirst + mCount);
 }
 
 bool
@@ -22,7 +29,7 @@ operator==(LedgerRange const& x, LedgerRange const& y)
     {
         return false;
     }
-    if (x.mLast != y.mLast)
+    if (x.mCount != y.mCount)
     {
         return false;
     }

@@ -59,6 +59,7 @@ struct BucketListGenerator
     {
         std::map<std::string, std::shared_ptr<Bucket>> buckets;
         auto has = getHistoryArchiveState();
+        has.prepareForPublish(*mAppApply);
         auto& wm = mAppApply->getWorkScheduler();
         wm.executeWork<T>(buckets, has,
                           mAppApply->getConfig().LEDGER_PROTOCOL_VERSION,
@@ -148,7 +149,7 @@ struct BucketListGenerator
     }
 
     HistoryArchiveState
-    getHistoryArchiveState() const
+    getHistoryArchiveState()
     {
         auto& blGenerate = mAppGenerate->getBucketManager().getBucketList();
         auto& bmApply = mAppApply->getBucketManager();
@@ -162,7 +163,8 @@ struct BucketListGenerator
             auto keepDead = BucketList::keepDeadEntries(i);
             {
                 BucketOutputIterator out(bmApply.getTmpDir(), keepDead, meta,
-                                         mergeCounters);
+                                         mergeCounters, mClock.getIOContext(),
+                                         /*doFsync=*/true);
                 for (BucketInputIterator in (level.getCurr()); in; ++in)
                 {
                     out.put(*in);
@@ -171,7 +173,8 @@ struct BucketListGenerator
             }
             {
                 BucketOutputIterator out(bmApply.getTmpDir(), keepDead, meta,
-                                         mergeCounters);
+                                         mergeCounters, mClock.getIOContext(),
+                                         /*doFsync=*/true);
                 for (BucketInputIterator in (level.getSnap()); in; ++in)
                 {
                     out.put(*in);
@@ -291,13 +294,17 @@ class ApplyBucketsWorkAddEntry : public ApplyBucketsWork
         if (!mAdded)
         {
             uint32_t minLedger = mEntry.lastModifiedLedgerSeq;
-            uint32_t maxLedger = std::numeric_limits<int32_t>::max();
+            uint32_t maxLedger = std::numeric_limits<int32_t>::max() - 1;
             auto& ltxRoot = mApp.getLedgerTxnRoot();
             size_t count =
-                ltxRoot.countObjects(ACCOUNT, {minLedger, maxLedger}) +
-                ltxRoot.countObjects(DATA, {minLedger, maxLedger}) +
-                ltxRoot.countObjects(OFFER, {minLedger, maxLedger}) +
-                ltxRoot.countObjects(TRUSTLINE, {minLedger, maxLedger});
+                ltxRoot.countObjects(
+                    ACCOUNT, LedgerRange::inclusive(minLedger, maxLedger)) +
+                ltxRoot.countObjects(
+                    DATA, LedgerRange::inclusive(minLedger, maxLedger)) +
+                ltxRoot.countObjects(
+                    OFFER, LedgerRange::inclusive(minLedger, maxLedger)) +
+                ltxRoot.countObjects(
+                    TRUSTLINE, LedgerRange::inclusive(minLedger, maxLedger));
 
             if (count > 0)
             {
@@ -559,7 +566,7 @@ TEST_CASE("BucketListIsConsistentWithDatabase test root account",
 }
 
 TEST_CASE("BucketListIsConsistentWithDatabase added entries",
-          "[invariant][bucketlistconsistent]")
+          "[invariant][bucketlistconsistent][acceptance]")
 {
     for (size_t nTests = 0; nTests < 40; ++nTests)
     {
@@ -577,7 +584,7 @@ TEST_CASE("BucketListIsConsistentWithDatabase added entries",
 }
 
 TEST_CASE("BucketListIsConsistentWithDatabase deleted entries",
-          "[invariant][bucketlistconsistent]")
+          "[invariant][bucketlistconsistent][acceptance]")
 {
     for (auto t : xdr::xdr_traits<LedgerEntryType>::enum_values())
     {
@@ -599,7 +606,7 @@ TEST_CASE("BucketListIsConsistentWithDatabase deleted entries",
 }
 
 TEST_CASE("BucketListIsConsistentWithDatabase modified entries",
-          "[invariant][bucketlistconsistent]")
+          "[invariant][bucketlistconsistent][acceptance]")
 {
     for (auto t : xdr::xdr_traits<LedgerEntryType>::enum_values())
     {
@@ -621,7 +628,7 @@ TEST_CASE("BucketListIsConsistentWithDatabase modified entries",
 }
 
 TEST_CASE("BucketListIsConsistentWithDatabase bucket bounds",
-          "[invariant][bucketlistconsistent]")
+          "[invariant][bucketlistconsistent][acceptance]")
 {
     struct LastModifiedBucketListGenerator : public BucketListGenerator
     {
@@ -703,7 +710,7 @@ TEST_CASE("BucketListIsConsistentWithDatabase bucket bounds",
 }
 
 TEST_CASE("BucketListIsConsistentWithDatabase merged LIVEENTRY and DEADENTRY",
-          "[invariant][bucketlistconsistent]")
+          "[invariant][bucketlistconsistent][acceptance]")
 {
     struct MergeBucketListGenerator : public SelectBucketListGenerator
     {

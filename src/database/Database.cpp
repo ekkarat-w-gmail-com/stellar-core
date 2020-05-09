@@ -25,7 +25,7 @@
 #include "overlay/BanManager.h"
 #include "overlay/OverlayManager.h"
 #include "overlay/PeerManager.h"
-#include "transactions/TransactionFrame.h"
+#include "transactions/TransactionSQL.h"
 
 #include "medida/counter.h"
 #include "medida/metrics_registry.h"
@@ -55,7 +55,9 @@ using namespace std;
 
 bool Database::gDriversRegistered = false;
 
-static unsigned long const SCHEMA_VERSION = 10;
+// smallest schema version supported
+static unsigned long const MIN_SCHEMA_VERSION = 9;
+static unsigned long const SCHEMA_VERSION = 12;
 
 // These should always match our compiled version precisely, since we are
 // using a bundled version to get access to carray(). But in case someone
@@ -137,9 +139,22 @@ class DatabaseConfigureSessionOp : public DatabaseTypeSpecificOperation<void>
         }
 
         mSession << "PRAGMA journal_mode = WAL";
+        // FULL is needed as to ensure durability
+        // NORMAL is enough for non validating nodes
+        // mSession << "PRAGMA synchronous = NORMAL";
+
+        // number of pages in WAL file
+        mSession << "PRAGMA wal_autocheckpoint=10000";
+
         // busy_timeout gives room for external processes
         // that may lock the database for some time
         mSession << "PRAGMA busy_timeout = 10000";
+
+        // adjust caches
+        // 20000 pages
+        mSession << "PRAGMA cache_size=-20000";
+        // 100 MB map
+        mSession << "PRAGMA mmap_size=104857600";
 
         // Register the sqlite carray() extension we use for bulk operations.
         sqlite3_carray_init(sq->conn_, nullptr, nullptr);
@@ -189,49 +204,56 @@ Database::applySchemaUpgrade(unsigned long vers)
     soci::transaction tx(mSession);
     switch (vers)
     {
-    case 7:
-        Upgrades::dropAll(*this);
-        mSession << "ALTER TABLE accounts ADD buyingliabilities BIGINT "
-                    "CHECK (buyingliabilities >= 0)";
-        mSession << "ALTER TABLE accounts ADD sellingliabilities BIGINT "
-                    "CHECK (sellingliabilities >= 0)";
-        mSession << "ALTER TABLE trustlines ADD buyingliabilities BIGINT "
-                    "CHECK (buyingliabilities >= 0)";
-        mSession << "ALTER TABLE trustlines ADD sellingliabilities BIGINT "
-                    "CHECK (sellingliabilities >= 0)";
-        break;
-
-    case 8:
-        mSession << "ALTER TABLE peers RENAME flags TO type";
-        mSession << "UPDATE peers SET type = 2*type";
-        break;
-    case 9:
-        // Update schema for signers
-        mSession << "ALTER TABLE accounts ADD signers TEXT";
-        mApp.getLedgerTxnRoot().writeSignersTableIntoAccountsTable();
-        mSession << "DROP TABLE IF EXISTS signers";
-
-        // Update schema for base-64 encoding
-        mApp.getLedgerTxnRoot().encodeDataNamesBase64();
-        mApp.getLedgerTxnRoot().encodeHomeDomainsBase64();
-
-        // Update schema for simplified offers table
-        mApp.getLedgerTxnRoot().writeOffersIntoSimplifiedOffersTable();
-        break;
     case 10:
         // add tracking table information
         mApp.getHerderPersistence().createQuorumTrackingTable(mSession);
         break;
+    case 11:
+        if (!mApp.getConfig().MODE_USES_IN_MEMORY_LEDGER)
+        {
+            mSession << "DROP INDEX IF EXISTS bestofferindex;";
+            mSession << "CREATE INDEX bestofferindex ON offers "
+                        "(sellingasset,buyingasset,price,offerid);";
+        }
+        break;
+    case 12:
+        if (!isSqlite())
+        {
+            // Set column collations to "C" if postgres; sqlite doesn't support
+            // altering them at all (and the defaults are correct anyways).
+            mSession << "ALTER TABLE accounts "
+                     << "ALTER COLUMN accountid "
+                     << "TYPE VARCHAR(56) COLLATE \"C\"";
+
+            mSession << "ALTER TABLE accountdata "
+                     << "ALTER COLUMN accountid "
+                     << "TYPE VARCHAR(56) COLLATE \"C\", "
+                     << "ALTER COLUMN dataname "
+                     << "TYPE VARCHAR(88) COLLATE \"C\"";
+
+            mSession << "ALTER TABLE offers "
+                     << "ALTER COLUMN sellerid "
+                     << "TYPE VARCHAR(56) COLLATE \"C\", "
+                     << "ALTER COLUMN buyingasset "
+                     << "TYPE TEXT COLLATE \"C\", "
+                     << "ALTER COLUMN sellingasset "
+                     << "TYPE TEXT COLLATE \"C\"";
+
+            mSession << "ALTER TABLE trustlines "
+                     << "ALTER COLUMN accountid "
+                     << "TYPE VARCHAR(56) COLLATE \"C\", "
+                     << "ALTER COLUMN issuer "
+                     << "TYPE VARCHAR(56) COLLATE \"C\", "
+                     << "ALTER COLUMN assetcode "
+                     << "TYPE VARCHAR(12) COLLATE \"C\"";
+        }
+
+        // With inflation disabled, it's not worth keeping
+        // the accountbalances index around.
+        mSession << "DROP INDEX IF EXISTS accountbalances";
+        break;
     default:
-        if (vers <= 6)
-        {
-            throw std::runtime_error(
-                "Database version is too old, must use at least 7");
-        }
-        else
-        {
-            throw std::runtime_error("Unknown DB schema version");
-        }
+        throw std::runtime_error("Unknown DB schema version");
     }
     tx.commit();
 }
@@ -240,6 +262,14 @@ void
 Database::upgradeToCurrentSchema()
 {
     auto vers = getDBSchemaVersion();
+    if (vers < MIN_SCHEMA_VERSION)
+    {
+        std::string s = ("DB schema version " + std::to_string(vers) +
+                         " is older than minimum supported schema " +
+                         std::to_string(MIN_SCHEMA_VERSION));
+        throw std::runtime_error(s);
+    }
+
     if (vers > SCHEMA_VERSION)
     {
         std::string s = ("DB schema version " + std::to_string(vers) +
@@ -362,6 +392,19 @@ Database::isSqlite() const
            std::string::npos;
 }
 
+std::string
+Database::getSimpleCollationClause() const
+{
+    if (isSqlite())
+    {
+        return "";
+    }
+    else
+    {
+        return " COLLATE \"C\" ";
+    }
+}
+
 bool
 Database::canUsePool() const
 {
@@ -388,22 +431,43 @@ Database::initialize()
     // normally you do not want to touch this section as
     // schema updates are done in applySchemaUpgrade
 
+    if (isSqlite() && mApp.getConfig().DATABASE.value != "sqlite3://:memory:")
+    {
+        // When we're in non-memory (i.e. "disk") mode of SQLite we want to bump
+        // up the page size to 64k (the maximum supported). On fast SSDs / NVMe
+        // this actually is a slight speed-loss, but it's a significant win on
+        // slow disks (spinning platters, low-IOPS EBS, etc.)
+        //
+        // To do this we need to disable journalling, adjust the page_size, then
+        // vacuum and re-enable journalling. NB: WAL mode is _ignored_ in memory
+        // mode, so it's important that this code not run in memory mode, it'll
+        // disable all journalling and silently _not_ re-enable it.
+
+        mSession << "PRAGMA journal_mode = OFF";
+        mSession << "PRAGMA page_size = 65536";
+        mSession << "VACUUM";
+        mSession << "PRAGMA journal_mode = WAL";
+    }
+
     // only time this section should be modified is when
     // consolidating changes found in applySchemaUpgrade here
-    mApp.getLedgerTxnRoot().dropAccounts();
-    mApp.getLedgerTxnRoot().dropOffers();
-    mApp.getLedgerTxnRoot().dropTrustLines();
+    Upgrades::dropAll(*this);
+    if (!mApp.getConfig().MODE_USES_IN_MEMORY_LEDGER)
+    {
+        mApp.getLedgerTxnRoot().dropAccounts();
+        mApp.getLedgerTxnRoot().dropOffers();
+        mApp.getLedgerTxnRoot().dropTrustLines();
+        mApp.getLedgerTxnRoot().dropData();
+    }
     OverlayManager::dropAll(*this);
     PersistentState::dropAll(*this);
     ExternalQueue::dropAll(*this);
     LedgerHeaderUtils::dropAll(*this);
-    TransactionFrame::dropAll(*this);
+    dropTransactionHistory(*this);
     HistoryManager::dropAll(*this);
-    mApp.getBucketManager().dropAll();
     HerderPersistence::dropAll(*this);
-    mApp.getLedgerTxnRoot().dropData();
     BanManager::dropAll(*this);
-    putSchemaVersion(6);
+    putSchemaVersion(MIN_SCHEMA_VERSION);
 
     LOG(INFO) << "* ";
     LOG(INFO) << "* The database has been initialized";

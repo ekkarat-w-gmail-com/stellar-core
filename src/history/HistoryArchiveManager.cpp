@@ -170,11 +170,10 @@ HistoryArchiveManager::initializeHistoryArchive(std::string const& arch) const
     auto& ws = mApp.getWorkScheduler();
 
     // First check that there's no existing HAS in the archive
-    HistoryArchiveState existing;
     CLOG(INFO, "History") << "Probing history archive '" << arch
                           << "' for existing state";
     auto getHas =
-        ws.executeWork<GetHistoryArchiveStateWork>(existing, 0, archive, 0);
+        ws.executeWork<GetHistoryArchiveStateWork>(0, archive, "hist-init", 0);
     if (getHas->getState() == BasicWork::State::WORK_SUCCESS)
     {
         CLOG(ERROR, "History")

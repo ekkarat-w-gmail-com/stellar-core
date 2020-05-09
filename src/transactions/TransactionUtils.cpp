@@ -15,6 +15,24 @@
 namespace stellar
 {
 
+bool
+checkAuthorization(LedgerTxnHeader const& header, LedgerEntry const& entry)
+{
+    if (header.current().ledgerVersion < 10)
+    {
+        if (!isAuthorized(entry))
+        {
+            return false;
+        }
+    }
+    else if (!isAuthorizedToMaintainLiabilities(entry))
+    {
+        throw std::runtime_error("Invalid authorization");
+    }
+
+    return true;
+}
+
 LedgerKey
 accountKey(AccountID const& accountID)
 {
@@ -230,7 +248,8 @@ addBalance(LedgerTxnHeader const& header, LedgerTxnEntry& entry, int64_t delta)
         {
             return true;
         }
-        if (!isAuthorized(entry))
+
+        if (!checkAuthorization(header, entry.current()))
         {
             return false;
         }
@@ -293,12 +312,12 @@ addBuyingLiabilities(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
     }
     else if (entry.current().data.type() == TRUSTLINE)
     {
-        auto& tl = entry.current().data.trustLine();
-        if (!isAuthorized(entry))
+        if (!checkAuthorization(header, entry.current()))
         {
             return false;
         }
 
+        auto& tl = entry.current().data.trustLine();
         int64_t maxLiabilities = tl.limit - tl.balance;
         bool res = stellar::addBalance(buyingLiab, delta, maxLiabilities);
         if (res)
@@ -386,12 +405,12 @@ addSellingLiabilities(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
     }
     else if (entry.current().data.type() == TRUSTLINE)
     {
-        auto& tl = entry.current().data.trustLine();
-        if (!isAuthorized(entry))
+        if (!checkAuthorization(header, entry.current()))
         {
             return false;
         }
 
+        auto& tl = entry.current().data.trustLine();
         int64_t maxLiabilities = tl.balance;
         bool res = stellar::addBalance(sellingLiab, delta, maxLiabilities);
         if (res)
@@ -428,6 +447,10 @@ getAvailableBalance(LedgerTxnHeader const& header, LedgerEntry const& le)
     }
     else if (le.data.type() == TRUSTLINE)
     {
+        // We only want to check auth starting from V10, so no need to look at
+        // the return value. This will throw if unauthorized
+        checkAuthorization(header, le);
+
         avail = le.data.trustLine().balance;
     }
     else
@@ -497,15 +520,16 @@ getMaxAmountReceive(LedgerTxnHeader const& header, LedgerEntry const& le)
     }
     if (le.data.type() == TRUSTLINE)
     {
-        int64_t amount = 0;
-        if (isAuthorized(le))
+        if (!checkAuthorization(header, le))
         {
-            auto const& tl = le.data.trustLine();
-            amount = tl.limit - tl.balance;
-            if (header.current().ledgerVersion >= 10)
-            {
-                amount -= getBuyingLiabilities(header, le);
-            }
+            return 0;
+        }
+
+        auto const& tl = le.data.trustLine();
+        int64_t amount = tl.limit - tl.balance;
+        if (header.current().ledgerVersion >= 10)
+        {
+            amount -= getBuyingLiabilities(header, le);
         }
         return amount;
     }
@@ -573,7 +597,8 @@ getOfferBuyingLiabilities(LedgerTxnHeader const& header,
     }
     auto const& oe = entry.data.offer();
     auto res = exchangeV10WithoutPriceErrorThresholds(
-        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX, false);
+        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX,
+        RoundingType::NORMAL);
     return res.numSheepSend;
 }
 
@@ -595,7 +620,8 @@ getOfferSellingLiabilities(LedgerTxnHeader const& header,
     }
     auto const& oe = entry.data.offer();
     auto res = exchangeV10WithoutPriceErrorThresholds(
-        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX, false);
+        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX,
+        RoundingType::NORMAL);
     return res.numWheatReceived;
 }
 
@@ -635,9 +661,15 @@ getSellingLiabilities(LedgerTxnHeader const& header,
 }
 
 uint64_t
+getStartingSequenceNumber(uint32_t ledgerSeq)
+{
+    return static_cast<uint64_t>(ledgerSeq) << 32;
+}
+
+uint64_t
 getStartingSequenceNumber(LedgerTxnHeader const& header)
 {
-    return static_cast<uint64_t>(header.current().ledgerSeq) << 32;
+    return getStartingSequenceNumber(header.current().ledgerSeq);
 }
 
 bool
@@ -659,6 +691,25 @@ isAuthorized(ConstLedgerTxnEntry const& entry)
 }
 
 bool
+isAuthorizedToMaintainLiabilities(LedgerEntry const& le)
+{
+    return isAuthorized(le) || (le.data.trustLine().flags &
+                                AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0;
+}
+
+bool
+isAuthorizedToMaintainLiabilities(LedgerTxnEntry const& entry)
+{
+    return isAuthorizedToMaintainLiabilities(entry.current());
+}
+
+bool
+isAuthorizedToMaintainLiabilities(ConstLedgerTxnEntry const& entry)
+{
+    return isAuthorizedToMaintainLiabilities(entry.current());
+}
+
+bool
 isAuthRequired(ConstLedgerTxnEntry const& entry)
 {
     return (entry.current().data.account().flags & AUTH_REQUIRED_FLAG) != 0;
@@ -674,6 +725,12 @@ void
 normalizeSigners(LedgerTxnEntry& entry)
 {
     auto& acc = entry.current().data.account();
+    normalizeSigners(acc);
+}
+
+void
+normalizeSigners(AccountEntry& acc)
+{
     std::sort(
         acc.signers.begin(), acc.signers.end(),
         [](Signer const& s1, Signer const& s2) { return s1.key < s2.key; });
@@ -687,16 +744,116 @@ releaseLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
 }
 
 void
-setAuthorized(LedgerTxnEntry& entry, bool authorized)
+setAuthorized(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
+              uint32_t authorized)
 {
-    auto& tl = entry.current().data.trustLine();
-    if (authorized)
+    if (!trustLineFlagIsValid(authorized, header))
     {
-        tl.flags |= AUTHORIZED_FLAG;
+        throw std::runtime_error("trying to set invalid trust line flag");
+    }
+    auto& tl = entry.current().data.trustLine();
+    tl.flags = authorized;
+}
+
+bool
+trustLineFlagIsValid(uint32_t flag, uint32_t ledgerVersion)
+{
+    if (ledgerVersion < 13)
+    {
+        return (flag & ~MASK_TRUSTLINE_FLAGS) == 0;
     }
     else
     {
-        tl.flags &= ~AUTHORIZED_FLAG;
+        uint32_t invalidAuthCombo =
+            AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
+        return (flag & ~MASK_TRUSTLINE_FLAGS_V13) == 0 &&
+               (flag & invalidAuthCombo) != invalidAuthCombo;
     }
 }
+
+AccountID
+toAccountID(MuxedAccount const& m)
+{
+    AccountID ret(static_cast<PublicKeyType>(m.type() & 0xff));
+    switch (m.type())
+    {
+    case KEY_TYPE_ED25519:
+        ret.ed25519() = m.ed25519();
+        break;
+    case KEY_TYPE_MUXED_ED25519:
+        ret.ed25519() = m.med25519().ed25519;
+        break;
+    default:
+        // this would be a bug
+        abort();
+    }
+    return ret;
 }
+
+MuxedAccount
+toMuxedAccount(AccountID const& a)
+{
+    MuxedAccount ret(static_cast<CryptoKeyType>(a.type()));
+    switch (a.type())
+    {
+    case PUBLIC_KEY_TYPE_ED25519:
+        ret.ed25519() = a.ed25519();
+        break;
+    default:
+        // this would be a bug
+        abort();
+    }
+    return ret;
+}
+
+bool
+trustLineFlagIsValid(uint32_t flag, LedgerTxnHeader const& header)
+{
+    return trustLineFlagIsValid(flag, header.current().ledgerVersion);
+}
+
+namespace detail
+{
+struct MuxChecker
+{
+    bool mHasMuxedAccount{false};
+
+    void
+    operator()(stellar::MuxedAccount const& t)
+    {
+        // checks if this is a multiplexed account,
+        // such as KEY_TYPE_MUXED_ED25519
+        if ((t.type() & 0x100) != 0)
+        {
+            mHasMuxedAccount = true;
+        }
+    }
+
+    template <typename T>
+    std::enable_if_t<(xdr::xdr_traits<T>::is_container ||
+                      xdr::xdr_traits<T>::is_class)>
+    operator()(T const& t)
+    {
+        if (!mHasMuxedAccount)
+        {
+            xdr::xdr_traits<T>::save(*this, t);
+        }
+    }
+
+    template <typename T>
+    std::enable_if_t<!(xdr::xdr_traits<T>::is_container ||
+                       xdr::xdr_traits<T>::is_class)>
+    operator()(T const& t)
+    {
+    }
+};
+} // namespace detail
+
+bool
+hasMuxedAccount(TransactionEnvelope const& e)
+{
+    detail::MuxChecker c;
+    c(e);
+    return c.mHasMuxedAccount;
+}
+} // namespace stellar

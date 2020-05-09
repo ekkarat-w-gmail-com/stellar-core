@@ -400,16 +400,20 @@ LedgerTxnRoot::Impl::dropTrustLines()
     mEntryCache.clear();
     mBestOffersCache.clear();
 
+    std::string coll = mDatabase.getSimpleCollationClause();
+
     mDatabase.getSession() << "DROP TABLE IF EXISTS trustlines;";
     mDatabase.getSession()
         << "CREATE TABLE trustlines"
-           "("
-           "accountid    VARCHAR(56)     NOT NULL,"
-           "assettype    INT             NOT NULL,"
-           "issuer       VARCHAR(56)     NOT NULL,"
-           "assetcode    VARCHAR(12)     NOT NULL,"
-           "tlimit       BIGINT          NOT NULL CHECK (tlimit > 0),"
+        << "("
+        << "accountid    VARCHAR(56) " << coll << " NOT NULL,"
+        << "assettype    INT             NOT NULL,"
+        << "issuer       VARCHAR(56) " << coll << " NOT NULL,"
+        << "assetcode    VARCHAR(12) " << coll << " NOT NULL,"
+        << "tlimit       BIGINT          NOT NULL CHECK (tlimit > 0),"
            "balance      BIGINT          NOT NULL CHECK (balance >= 0),"
+           "buyingliabilities BIGINT CHECK (buyingliabilities >= 0),"
+           "sellingliabilities BIGINT CHECK (sellingliabilities >= 0),"
            "flags        INT             NOT NULL,"
            "lastmodified INT             NOT NULL,"
            "PRIMARY KEY  (accountid, issuer, assetcode)"
@@ -559,8 +563,13 @@ class BulkLoadTrustLinesOperation
             "FROM trustlines WHERE (accountid, issuer, assetcode) IN r";
 
         auto prep = mDb.getPreparedStatement(sql);
-        auto sqliteStatement = dynamic_cast<soci::sqlite3_statement_backend*>(
-            prep.statement().get_backend());
+        auto be = prep.statement().get_backend();
+        if (be == nullptr)
+        {
+            throw std::runtime_error("no sql backend");
+        }
+        auto sqliteStatement =
+            dynamic_cast<soci::sqlite3_statement_backend*>(be);
         auto st = sqliteStatement->stmt_;
 
         sqlite3_reset(st);

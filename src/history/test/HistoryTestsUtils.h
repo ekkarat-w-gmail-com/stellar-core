@@ -64,8 +64,8 @@ class S3HistoryConfigurator : public HistoryConfigurator
 
 class TmpDirHistoryConfigurator : public HistoryConfigurator
 {
+    std::string mName;
     TmpDirManager mArchtmp;
-    TmpDir mDir;
 
   public:
     TmpDirHistoryConfigurator();
@@ -75,13 +75,25 @@ class TmpDirHistoryConfigurator : public HistoryConfigurator
     Config& configure(Config& cfg, bool writable) const override;
 };
 
-class ProtocolVersionTmpDirHistoryConfigurator
-    : public TmpDirHistoryConfigurator
+class MultiArchiveHistoryConfigurator : public HistoryConfigurator
 {
-    uint32_t mProtocolVersion;
+    std::vector<std::shared_ptr<TmpDirHistoryConfigurator>> mConfigurators;
 
   public:
-    ProtocolVersionTmpDirHistoryConfigurator(uint32_t protocolVersion);
+    explicit MultiArchiveHistoryConfigurator(uint32_t numArchives = 2);
+
+    Config& configure(Config& cfg, bool writable) const;
+
+    std::vector<std::shared_ptr<TmpDirHistoryConfigurator>>
+    getConfigurators() const
+    {
+        return mConfigurators;
+    }
+};
+
+class RealGenesisTmpDirHistoryConfigurator : public TmpDirHistoryConfigurator
+{
+  public:
     Config& configure(Config& cfg, bool writable) const override;
 };
 
@@ -92,7 +104,8 @@ class BucketOutputIteratorForTesting : public BucketOutputIterator
   public:
     explicit BucketOutputIteratorForTesting(std::string const& tmpDir,
                                             uint32_t protocolVersion,
-                                            MergeCounters& mc);
+                                            MergeCounters& mc,
+                                            asio::io_context& ctx);
     std::pair<std::string, uint256> writeTmpTestBucket();
 };
 
@@ -215,18 +228,20 @@ class CatchupSimulation
     std::vector<SequenceNumber> bobSeqs;
     std::vector<SequenceNumber> carolSeqs;
 
+    uint32_t mTestProtocolShadowsRemovedLedgerSeq{0};
+
     CatchupMetrics getCatchupMetrics(Application::pointer app);
     CatchupPerformedWork computeCatchupPerformedWork(
         uint32_t lastClosedLedger,
-        CatchupConfiguration const& catchupConfiguration,
-        HistoryManager const& historyManager);
+        CatchupConfiguration const& catchupConfiguration, Application& app);
     void validateCatchup(Application::pointer app);
 
   public:
     explicit CatchupSimulation(
         VirtualClock::Mode mode = VirtualClock::VIRTUAL_TIME,
         std::shared_ptr<HistoryConfigurator> cg =
-            std::make_shared<TmpDirHistoryConfigurator>());
+            std::make_shared<TmpDirHistoryConfigurator>(),
+        bool startApp = true);
     ~CatchupSimulation();
 
     Application&
@@ -247,15 +262,9 @@ class CatchupSimulation
         return *mHistoryConfigurator.get();
     }
 
-    BucketList
-    getBucketListAtLastPublish() const
-    {
-        return mBucketListAtLastPublish;
-    }
-
     uint32_t getLastCheckpointLedger(uint32_t checkpointIndex) const;
 
-    void generateRandomLedger();
+    void generateRandomLedger(uint32_t version = 0);
 
     void ensurePublishesComplete();
     void ensureLedgerAvailable(uint32_t targetLedger);
@@ -263,16 +272,21 @@ class CatchupSimulation
     void ensureOnlineCatchupPossible(uint32_t targetLedger,
                                      uint32_t bufferLedgers = 0);
 
-    Application::pointer createCatchupApplication(
-        uint32_t count, Config::TestDbMode dbMode, std::string const& appName,
-        uint32_t protocol = Config::CURRENT_LEDGER_PROTOCOL_VERSION);
-    bool catchupOffline(Application::pointer app, uint32_t toLedger);
+    Application::pointer createCatchupApplication(uint32_t count,
+                                                  Config::TestDbMode dbMode,
+                                                  std::string const& appName,
+                                                  bool publish = false);
+    bool catchupOffline(Application::pointer app, uint32_t toLedger,
+                        bool extraValidation = false);
     bool catchupOnline(Application::pointer app, uint32_t initLedger,
-                       uint32_t bufferLedgers = 0, uint32_t gapLedger = 0);
+                       uint32_t bufferLedgers = 0, uint32_t gapLedger = 0,
+                       int32_t numGapLedgers = 1);
 
     void crankUntil(Application::pointer app,
                     std::function<bool()> const& predicate,
                     VirtualClock::duration duration);
+
+    void setProto12UpgradeLedger(uint32_t ledger);
 };
 }
 }

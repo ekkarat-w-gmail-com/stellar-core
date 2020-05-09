@@ -13,8 +13,13 @@
 #include "overlay/Floodgate.h"
 #include "overlay/ItemFetcher.h"
 #include "overlay/OverlayManager.h"
+#include "overlay/OverlayMetrics.h"
 #include "overlay/StellarXDR.h"
+#include "overlay/SurveyManager.h"
+#include "util/Logging.h"
 #include "util/Timer.h"
+
+#include "lib/util/lrucache.hpp"
 
 #include <future>
 #include <set>
@@ -76,9 +81,10 @@ class OverlayManagerImpl : public OverlayManager
     LoadManager mLoad;
     bool mShuttingDown;
 
-    medida::Meter& mMessagesBroadcast;
-    medida::Counter& mPendingPeersSize;
-    medida::Counter& mAuthenticatedPeersSize;
+    OverlayMetrics mOverlayMetrics;
+
+    // NOTE: bool is used here as a placeholder, since no ValueType is needed.
+    cache::lru_cache<uint64_t, bool> mMessageCache;
 
     void tick();
     VirtualTimer mTimer;
@@ -88,12 +94,16 @@ class OverlayManagerImpl : public OverlayManager
 
     Floodgate mFloodGate;
 
+    std::shared_ptr<SurveyManager> mSurveyManager;
+
   public:
     OverlayManagerImpl(Application& app);
     ~OverlayManagerImpl();
 
     void ledgerClosed(uint32_t lastClosedledgerSeq) override;
-    void recvFloodedMsg(StellarMessage const& msg, Peer::pointer peer) override;
+    bool recvFloodedMsgID(StellarMessage const& msg, Peer::pointer peer,
+                          Hash& msgID) override;
+    void forgetFloodedMsg(Hash const& msgID) override;
     void broadcastMessage(StellarMessage const& msg,
                           bool force = false) override;
     void connectTo(PeerBareAddress const& address) override;
@@ -121,18 +131,29 @@ class OverlayManagerImpl : public OverlayManager
     Peer::pointer getConnectedPeer(PeerBareAddress const& address) override;
 
     std::vector<Peer::pointer> getRandomAuthenticatedPeers() override;
+    std::vector<Peer::pointer> getRandomInboundAuthenticatedPeers() override;
+    std::vector<Peer::pointer> getRandomOutboundAuthenticatedPeers() override;
 
     std::set<Peer::pointer> getPeersKnows(Hash const& h) override;
 
+    OverlayMetrics& getOverlayMetrics() override;
     PeerAuth& getPeerAuth() override;
 
     LoadManager& getLoadManager() override;
     PeerManager& getPeerManager() override;
 
+    SurveyManager& getSurveyManager() override;
+
     void start() override;
     void shutdown() override;
 
     bool isShuttingDown() const override;
+
+    void recordMessageMetric(StellarMessage const& stellarMsg,
+                             Peer::pointer peer) override;
+
+    void updateFloodRecord(StellarMessage const& oldMsg,
+                           StellarMessage const& newMsg) override;
 
   private:
     struct ResolvedPeers
@@ -167,5 +188,9 @@ class OverlayManagerImpl : public OverlayManager
     bool isPossiblyPreferred(std::string const& ip);
 
     void updateSizeCounters();
+
+    void extractPeersFromMap(std::map<NodeID, Peer::pointer> const& peerMap,
+                             std::vector<Peer::pointer>& result);
+    void shufflePeerList(std::vector<Peer::pointer>& peerList);
 };
 }

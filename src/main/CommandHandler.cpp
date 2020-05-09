@@ -17,6 +17,8 @@
 #include "main/Maintainer.h"
 #include "overlay/BanManager.h"
 #include "overlay/OverlayManager.h"
+#include "overlay/SurveyManager.h"
+#include "transactions/TransactionBridge.h"
 #include "transactions/TransactionUtils.h"
 #include "util/Logging.h"
 #include "util/StatusManager.h"
@@ -70,25 +72,32 @@ CommandHandler::CommandHandler(Application& app) : mApp(app)
 
     mServer->add404(std::bind(&CommandHandler::fileNotFound, this, _1, _2));
 
+    if (mApp.getConfig().MODE_STORES_HISTORY)
+    {
+        addRoute("dropcursor", &CommandHandler::dropcursor);
+        addRoute("getcursor", &CommandHandler::getcursor);
+        addRoute("setcursor", &CommandHandler::setcursor);
+        addRoute("maintenance", &CommandHandler::maintenance);
+    }
+
     addRoute("bans", &CommandHandler::bans);
     addRoute("clearmetrics", &CommandHandler::clearMetrics);
     addRoute("connect", &CommandHandler::connect);
-    addRoute("dropcursor", &CommandHandler::dropcursor);
     addRoute("droppeer", &CommandHandler::dropPeer);
-    addRoute("getcursor", &CommandHandler::getcursor);
     addRoute("info", &CommandHandler::info);
     addRoute("ll", &CommandHandler::ll);
     addRoute("logrotate", &CommandHandler::logRotate);
-    addRoute("maintenance", &CommandHandler::maintenance);
     addRoute("manualclose", &CommandHandler::manualClose);
     addRoute("metrics", &CommandHandler::metrics);
     addRoute("peers", &CommandHandler::peers);
     addRoute("quorum", &CommandHandler::quorum);
-    addRoute("setcursor", &CommandHandler::setcursor);
     addRoute("scp", &CommandHandler::scpInfo);
     addRoute("tx", &CommandHandler::tx);
     addRoute("unban", &CommandHandler::unban);
     addRoute("upgrades", &CommandHandler::upgrades);
+    addRoute("surveytopology", &CommandHandler::surveyTopology);
+    addRoute("stopsurvey", &CommandHandler::stopSurvey);
+    addRoute("getsurveyresult", &CommandHandler::getSurveyResult);
 
 #ifdef BUILD_TESTS
     addRoute("generateload", &CommandHandler::generateLoad);
@@ -124,7 +133,7 @@ CommandHandler::safeRouter(CommandHandler::HandlerRoute route,
     }
 }
 
-void
+std::string
 CommandHandler::manualCmd(std::string const& cmd)
 {
     http::server::reply reply;
@@ -132,6 +141,7 @@ CommandHandler::manualCmd(std::string const& cmd)
     request.uri = cmd;
     mServer->handle_request(request, reply);
     LOG(INFO) << cmd << " -> " << reply.content;
+    return reply.content;
 }
 
 void
@@ -201,8 +211,12 @@ parseParam(std::map<std::string, std::string> const& map,
 }
 
 void
-CommandHandler::peers(std::string const&, std::string& retStr)
+CommandHandler::peers(std::string const& params, std::string& retStr)
 {
+    std::map<std::string, std::string> retMap;
+    http::server::server::parseParams(params, retMap);
+
+    bool fullKeys = retMap["fullkeys"] == "true";
     Json::Value root;
 
     auto& pendingPeers = root["pending_peers"];
@@ -230,9 +244,12 @@ CommandHandler::peers(std::string const&, std::string& retStr)
             {
                 auto& peerNode = node[counter++];
                 peerNode["address"] = peer.second->toString();
+                peerNode["elapsed"] = (int)peer.second->getLifeTime().count();
+                peerNode["latency"] = (int)peer.second->getPing().count();
                 peerNode["ver"] = peer.second->getRemoteVersion();
                 peerNode["olver"] = (int)peer.second->getRemoteOverlayVersion();
-                peerNode["id"] = mApp.getConfig().toStrKey(peer.first);
+                peerNode["id"] =
+                    mApp.getConfig().toStrKey(peer.first, fullKeys);
             }
         };
     addAuthenticatedPeers(
@@ -506,10 +523,10 @@ CommandHandler::ll(std::string const& params, std::string& retStr)
     }
     else
     {
-        partition = Logging::normalizePartition(partition);
         el::Level level = Logging::getLLfromString(levelStr);
         if (partition.size())
         {
+            partition = Logging::normalizePartition(partition);
             Logging::setLogLevel(level, partition.c_str());
             root[partition] = Logging::getStringFromLL(level);
         }
@@ -535,11 +552,18 @@ CommandHandler::tx(std::string const& params, std::string& retStr)
         std::string blob = params.substr(prefix.size());
         std::vector<uint8_t> binBlob;
         decoder::decode_b64(blob, binBlob);
-
         xdr::xdr_from_opaque(binBlob, envelope);
-        TransactionFramePtr transaction =
-            TransactionFrame::makeTransactionFromWire(mApp.getNetworkID(),
-                                                      envelope);
+
+        {
+            auto lhhe = mApp.getLedgerManager().getLastClosedLedgerHeader();
+            if (lhhe.header.ledgerVersion >= 13)
+            {
+                envelope = txbridge::convertForV13(envelope);
+            }
+        }
+
+        auto transaction = TransactionFrameBase::makeTransactionFromWire(
+            mApp.getNetworkID(), envelope);
         if (transaction)
         {
             // add it to our current set
@@ -680,6 +704,43 @@ CommandHandler::clearMetrics(std::string const& params, std::string& retStr)
     mApp.clearMetrics(domain);
 
     retStr = fmt::format("Cleared {} metrics!", domain);
+}
+
+void
+CommandHandler::surveyTopology(std::string const& params, std::string& retStr)
+{
+    std::map<std::string, std::string> map;
+    http::server::server::parseParams(params, map);
+
+    auto duration = std::chrono::seconds(parseParam<uint32>(map, "duration"));
+    auto idString = parseParam<std::string>(map, "node");
+    NodeID id = KeyUtils::fromStrKey<PublicKey>(idString);
+
+    auto& surveyManager = mApp.getOverlayManager().getSurveyManager();
+
+    bool success = surveyManager.startSurvey(
+        SurveyMessageCommandType::SURVEY_TOPOLOGY, duration);
+
+    surveyManager.addNodeToRunningSurveyBacklog(
+        SurveyMessageCommandType::SURVEY_TOPOLOGY, duration, id);
+    retStr = "Adding node.";
+
+    retStr += success ? "Survey started " : "Survey already running!";
+}
+
+void
+CommandHandler::stopSurvey(std::string const&, std::string& retStr)
+{
+    auto& surveyManager = mApp.getOverlayManager().getSurveyManager();
+    surveyManager.stopSurvey();
+    retStr = "survey stopped";
+}
+
+void
+CommandHandler::getSurveyResult(std::string const&, std::string& retStr)
+{
+    auto& surveyManager = mApp.getOverlayManager().getSurveyManager();
+    retStr = surveyManager.getJsonResults().toStyledString();
 }
 
 #ifdef BUILD_TESTS

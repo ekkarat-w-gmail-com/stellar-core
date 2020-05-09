@@ -1,11 +1,16 @@
 #include "main/dumpxdr.h"
+#include "crypto/Hex.h"
 #include "crypto/SecretKey.h"
 #include "transactions/SignatureUtils.h"
+#include "transactions/TransactionBridge.h"
 #include "util/Decoder.h"
 #include "util/Fs.h"
 #include "util/XDROperators.h"
 #include "util/XDRStream.h"
 #include "util/format.h"
+#include "util/types.h"
+#include <cereal/archives/json.hpp>
+#include <cereal/cereal.hpp>
 #include <iostream>
 #include <regex>
 #include <xdrpp/printer.h>
@@ -30,6 +35,78 @@ extern "C" {
 
 using namespace std::placeholders;
 
+template <uint32_t N>
+void
+cereal_override(cereal::JSONOutputArchive& ar, const xdr::opaque_array<N>& s,
+                const char* field)
+{
+    xdr::archive(ar, stellar::binToHex(stellar::ByteSlice(s.data(), s.size())),
+                 field);
+}
+
+// We still need one explicit composite-container override because cereal
+// appears to process arrays-of-arrays internally, without calling back through
+// an NVP adaptor.
+template <uint32_t N>
+void
+cereal_override(cereal::JSONOutputArchive& ar,
+                const xdr::xarray<stellar::Hash, N>& s, const char* field)
+{
+    std::vector<std::string> tmp;
+    for (auto const& h : s)
+    {
+        tmp.emplace_back(
+            stellar::binToHex(stellar::ByteSlice(h.data(), h.size())));
+    }
+    xdr::archive(ar, tmp, field);
+}
+
+template <uint32_t N>
+void
+cereal_override(cereal::JSONOutputArchive& ar, const xdr::opaque_vec<N>& s,
+                const char* field)
+{
+    xdr::archive(ar, stellar::binToHex(stellar::ByteSlice(s.data(), s.size())),
+                 field);
+}
+void
+cereal_override(cereal::JSONOutputArchive& ar, const stellar::PublicKey& s,
+                const char* field)
+{
+    xdr::archive(ar, stellar::KeyUtils::toStrKey<stellar::PublicKey>(s), field);
+}
+void
+cereal_override(cereal::JSONOutputArchive& ar, const stellar::Asset& s,
+                const char* field)
+{
+    xdr::archive(ar, stellar::assetToString(s), field);
+}
+
+template <typename T>
+void
+cereal_override(cereal::JSONOutputArchive& ar, const xdr::pointer<T>& t,
+                const char* field)
+{
+    // We tolerate a little information-loss here collapsing *T into T for
+    // the non-null case, and use JSON 'null' for the null case. This reads
+    // much better than the thing JSONOutputArchive does with PtrWrapper.
+    if (t)
+    {
+        xdr::archive(ar, *t, field);
+    }
+    else
+    {
+        ar.setNextName(field);
+        ar.writeName();
+        ar.saveValue(nullptr);
+    }
+}
+
+// This has to be included _after_ the cereal_override overloads above,
+// otherwise some interplay of name lookup and visibility during the
+// enable_if call in the cereal adaptor fails to find them.
+#include <xdrpp/cereal.h>
+
 namespace stellar
 {
 
@@ -41,17 +118,29 @@ xdr_printer(const PublicKey& pk)
 
 template <typename T>
 void
-dumpstream(XDRInputFileStream& in)
+dumpstream(XDRInputFileStream& in, bool json)
 {
     T tmp;
-    while (in && in.readOne(tmp))
+    if (json)
     {
-        std::cout << xdr::xdr_to_string(tmp) << std::endl;
+        cereal::JSONOutputArchive archive(std::cout);
+        archive.makeArray();
+        while (in && in.readOne(tmp))
+        {
+            archive(tmp);
+        }
+    }
+    else
+    {
+        while (in && in.readOne(tmp))
+        {
+            std::cout << xdr::xdr_to_string(tmp) << std::endl;
+        }
     }
 }
 
 void
-dumpXdrStream(std::string const& filename)
+dumpXdrStream(std::string const& filename, bool json)
 {
     std::regex rx(
         ".*(ledger|bucket|transactions|results|scp)-[[:xdigit:]]+\\.xdr");
@@ -63,24 +152,24 @@ dumpXdrStream(std::string const& filename)
 
         if (sm[1] == "ledger")
         {
-            dumpstream<LedgerHeaderHistoryEntry>(in);
+            dumpstream<LedgerHeaderHistoryEntry>(in, json);
         }
         else if (sm[1] == "bucket")
         {
-            dumpstream<BucketEntry>(in);
+            dumpstream<BucketEntry>(in, json);
         }
         else if (sm[1] == "transactions")
         {
-            dumpstream<TransactionHistoryEntry>(in);
+            dumpstream<TransactionHistoryEntry>(in, json);
         }
         else if (sm[1] == "results")
         {
-            dumpstream<TransactionHistoryResultEntry>(in);
+            dumpstream<TransactionHistoryResultEntry>(in, json);
         }
         else
         {
             assert(sm[1] == "scp");
-            dumpstream<SCPHistoryEntry>(in);
+            dumpstream<SCPHistoryEntry>(in, json);
         }
     }
     else
@@ -292,7 +381,8 @@ signtxn(std::string const& filename, std::string netId, bool base64)
 
         TransactionEnvelope txenv;
         xdr::xdr_from_opaque(readFile(filename, base64), txenv);
-        if (txenv.signatures.size() == txenv.signatures.max_size())
+        auto& signatures = txbridge::getSignatures(txenv);
+        if (signatures.size() == signatures.max_size())
             throw std::runtime_error(
                 "Evelope already contains maximum number of signatures");
 
@@ -300,9 +390,29 @@ signtxn(std::string const& filename, std::string netId, bool base64)
             readSecret("Secret key seed: ", txn_stdin)));
         TransactionSignaturePayload payload;
         payload.networkId = sha256(netId);
-        payload.taggedTransaction.type(ENVELOPE_TYPE_TX);
-        payload.taggedTransaction.tx() = txenv.tx;
-        txenv.signatures.emplace_back(
+        switch (txenv.type())
+        {
+        case ENVELOPE_TYPE_TX_V0:
+            payload.taggedTransaction.type(ENVELOPE_TYPE_TX);
+            // TransactionV0 and Transaction always have the same signatures so
+            // there is no reason to check versions here, just always convert to
+            // Transaction
+            payload.taggedTransaction.tx() =
+                txbridge::convertForV13(txenv).v1().tx;
+            break;
+        case ENVELOPE_TYPE_TX:
+            payload.taggedTransaction.type(ENVELOPE_TYPE_TX);
+            payload.taggedTransaction.tx() = txenv.v1().tx;
+            break;
+        case ENVELOPE_TYPE_TX_FEE_BUMP:
+            payload.taggedTransaction.type(ENVELOPE_TYPE_TX_FEE_BUMP);
+            payload.taggedTransaction.feeBump() = txenv.feeBump().tx;
+            break;
+        default:
+            abort();
+        }
+
+        signatures.emplace_back(
             SignatureUtils::getHint(sk.getPublicKey().ed25519()),
             sk.sign(sha256(xdr::xdr_to_opaque(payload))));
 

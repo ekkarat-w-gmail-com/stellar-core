@@ -6,6 +6,7 @@
 
 #include "TxSetFrame.h"
 #include "Upgrades.h"
+#include "herder/QuorumTracker.h"
 #include "herder/TransactionQueue.h"
 #include "lib/json/json-forwards.h"
 #include "overlay/Peer.h"
@@ -51,9 +52,6 @@ class Herder
     // How many ledger in the future we consider an envelope viable.
     static uint32 const LEDGER_VALIDITY_BRACKET;
 
-    // How many ledgers in the past we keep track of
-    static uint32 const MAX_SLOTS_TO_REMEMBER;
-
     // Threshold used to filter out irrelevant events.
     static std::chrono::nanoseconds const TIMERS_THRESHOLD_NANOSEC;
 
@@ -68,18 +66,19 @@ class Herder
 
     enum EnvelopeStatus
     {
-        // for some reason this envelope was discarded - either is was invalid,
+        // for some reason this envelope was discarded - either it was invalid,
         // used unsane qset or was coming from node that is not in quorum
-        ENVELOPE_STATUS_DISCARDED,
+        ENVELOPE_STATUS_DISCARDED = -100,
         // envelope was skipped as it's from this validator
-        ENVELOPE_STATUS_SKIPPED_SELF,
+        ENVELOPE_STATUS_SKIPPED_SELF = -10,
+        // envelope was already processed
+        ENVELOPE_STATUS_PROCESSED = -1,
+
         // envelope data is currently being fetched
-        ENVELOPE_STATUS_FETCHING,
+        ENVELOPE_STATUS_FETCHING = 0,
         // current call to recvSCPEnvelope() was the first when the envelope
         // was fully fetched so it is ready for processing
-        ENVELOPE_STATUS_READY,
-        // envelope was already processed
-        ENVELOPE_STATUS_PROCESSED,
+        ENVELOPE_STATUS_READY = 1
     };
 
     virtual State getState() const = 0;
@@ -90,6 +89,7 @@ class Herder
     virtual void syncMetrics() = 0;
 
     virtual void bootstrap() = 0;
+    virtual void shutdown() = 0;
 
     // restores Herder's state from disk
     virtual void restoreState() = 0;
@@ -99,7 +99,7 @@ class Herder
     virtual bool recvTxSet(Hash const& hash, TxSetFrame const& txset) = 0;
     // We are learning about a new transaction.
     virtual TransactionQueue::AddResult
-    recvTransaction(TransactionFramePtr tx) = 0;
+    recvTransaction(TransactionFrameBasePtr tx) = 0;
     virtual void peerDoesntHave(stellar::MessageType type,
                                 uint256 const& itemID, Peer::pointer peer) = 0;
     virtual TxSetFramePtr getTxSet(Hash const& hash) = 0;
@@ -144,5 +144,7 @@ class Herder
     virtual Json::Value getJsonTransitiveQuorumInfo(NodeID const& id,
                                                     bool summary,
                                                     bool fullKeys) = 0;
+    virtual QuorumTracker::QuorumMap const&
+    getCurrentlyTrackedQuorum() const = 0;
 };
 }

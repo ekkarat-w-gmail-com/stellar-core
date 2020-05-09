@@ -19,13 +19,15 @@ stellar_core_LDADD = $(soci_LIBS) $(libmedida_LIBS)		\
 	$(libpq_LIBS) $(xdrpp_LIBS) $(libsodium_LIBS)
 
 TESTDATA_DIR = testdata
-TEST_FILES = $(TESTDATA_DIR)/stellar-core_example.cfg $(TESTDATA_DIR)/stellar-core_standalone.cfg $(TESTDATA_DIR)/stellar-core_testnet.cfg \
-	     $(TESTDATA_DIR)/stellar-history.testnet.6714239.json $(TESTDATA_DIR)/stellar-history.livenet.15686975.json
+TEST_FILES = $(TESTDATA_DIR)/stellar-core_example.cfg $(TESTDATA_DIR)/stellar-core_standalone.cfg \
+             $(TESTDATA_DIR)/stellar-core_testnet.cfg $(TESTDATA_DIR)/stellar-core_testnet_legacy.cfg \
+	     $(TESTDATA_DIR)/stellar-history.testnet.6714239.json $(TESTDATA_DIR)/stellar-history.livenet.15686975.json $(TESTDATA_DIR)/stellar-core_example_validators.cfg
 
 BUILT_SOURCES = $(SRC_X_FILES:.x=.h) main/StellarCoreVersion.cpp $(TEST_FILES)
 
+$(SRC_X_FILES:.x=.h): $(XDRC)
 SUFFIXES = .x .h
-.x.h: $(XDRC)
+.x.h:
 	$(XDRC) -hh -o $@ $<
 
 $(srcdir)/src.mk: $(top_srcdir)/make-mks
@@ -63,16 +65,21 @@ format: always
 endif # USE_CLANG_FORMAT
 
 if USE_AFL_FUZZ
+FUZZER_MODE ?= overlay
+
 fuzz-testcases: stellar-core
 	mkdir -p fuzz-testcases
-	for i in `seq 1 10`; do \
-	    ./stellar-core --genfuzz fuzz-testcases/fuzz$$i.xdr; \
+	for i in `seq 1 10000`; do \
+	    ./stellar-core gen-fuzz fuzz-testcases/fuzz$$i.xdr --mode=${FUZZER_MODE}; \
 	done
+	mkdir -p min-testcases
+	afl-cmin -i fuzz-testcases -o min-testcases -m 250 -t 250 ./stellar-core fuzz @@ --mode=${FUZZER_MODE}
+	rm -Rf fuzz-testcases
 
 fuzz: fuzz-testcases stellar-core
 	mkdir -p fuzz-findings
-	afl-fuzz -m 8000 -t 250 -i fuzz-testcases -o fuzz-findings \
-	    ./stellar-core --fuzz @@
+	afl-fuzz -m 250 -t 250 -i min-testcases -o fuzz-findings \
+	    ./stellar-core fuzz @@ --mode=${FUZZER_MODE}
 
 fuzz-clean: always
 	rm -Rf fuzz-testcases fuzz-findings

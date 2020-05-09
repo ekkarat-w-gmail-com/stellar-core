@@ -7,6 +7,7 @@
 #include "database/Database.h"
 #include "database/DatabaseTypeSpecificOperation.h"
 #include "ledger/LedgerTxnImpl.h"
+#include "transactions/TransactionUtils.h"
 #include "util/Decoder.h"
 #include "util/Logging.h"
 #include "util/XDROperators.h"
@@ -62,30 +63,28 @@ LedgerTxnRoot::Impl::loadAllOffers() const
     return offers;
 }
 
-std::list<LedgerEntry>::const_iterator
-LedgerTxnRoot::Impl::loadBestOffers(std::list<LedgerEntry>& offers,
+std::deque<LedgerEntry>::const_iterator
+LedgerTxnRoot::Impl::loadBestOffers(std::deque<LedgerEntry>& offers,
                                     Asset const& buying, Asset const& selling,
-                                    size_t numOffers, size_t offset) const
+                                    size_t numOffers) const
 {
+    // price is an approximation of the actual n/d (truncated math, 15 digits)
+    // ordering by offerid gives precendence to older offers for fairness
     std::string sql = "SELECT sellerid, offerid, sellingasset, buyingasset, "
                       "amount, pricen, priced, flags, lastmodified "
                       "FROM offers "
-                      "WHERE sellingasset = :v1 AND buyingasset = :v2";
+                      "WHERE sellingasset = :v1 AND buyingasset = :v2 "
+                      "ORDER BY price, offerid LIMIT :n";
 
     std::string buyingAsset, sellingAsset;
     buyingAsset = decoder::encode_b64(xdr::xdr_to_opaque(buying));
     sellingAsset = decoder::encode_b64(xdr::xdr_to_opaque(selling));
-
-    // price is an approximation of the actual n/d (truncated math, 15 digits)
-    // ordering by offerid gives precendence to older offers for fairness
-    sql += " ORDER BY price, offerid LIMIT :n OFFSET :o";
 
     auto prep = mDatabase.getPreparedStatement(sql);
     auto& st = prep.statement();
     st.exchange(soci::use(sellingAsset));
     st.exchange(soci::use(buyingAsset));
     st.exchange(soci::use(numOffers));
-    st.exchange(soci::use(offset));
 
     {
         auto timer = mDatabase.getSelectTimer("offer");
@@ -93,17 +92,68 @@ LedgerTxnRoot::Impl::loadBestOffers(std::list<LedgerEntry>& offers,
     }
 }
 
-// Note: The order induced by this function must match the order used in the
-// SQL query for loadBestOffers above.
-bool
-isBetterOffer(LedgerEntry const& lhsEntry, LedgerEntry const& rhsEntry)
+std::deque<LedgerEntry>::const_iterator
+LedgerTxnRoot::Impl::loadBestOffers(std::deque<LedgerEntry>& offers,
+                                    Asset const& buying, Asset const& selling,
+                                    OfferDescriptor const& worseThan,
+                                    size_t numOffers) const
 {
-    auto const& lhs = lhsEntry.data.offer();
-    auto const& rhs = rhsEntry.data.offer();
+    // ManageOffer and related operations won't work correctly with an offerID
+    // equal to or exceeding INT64_MAX, so there is no reason to support it
+    // here. We are far from this limit anyway.
+    if (worseThan.offerID == INT64_MAX)
+    {
+        throw std::runtime_error("maximum offerID encountered");
+    }
 
-    assert(lhs.buying == rhs.buying);
-    assert(lhs.selling == rhs.selling);
+    // price is an approximation of the actual n/d (truncated math, 15 digits)
+    // ordering by offerid gives precendence to older offers for fairness
+    std::string sql =
+        "WITH r1 AS "
+        "(SELECT sellerid, offerid, sellingasset, buyingasset, amount, price, "
+        "pricen, priced, flags, lastmodified FROM offers "
+        "WHERE sellingasset = :v1 AND buyingasset = :v2 AND price > :v3 "
+        "ORDER BY price, offerid LIMIT :v4), "
+        "r2 AS "
+        "(SELECT sellerid, offerid, sellingasset, buyingasset, amount, price, "
+        "pricen, priced, flags, lastmodified FROM offers "
+        "WHERE sellingasset = :v5 AND buyingasset = :v6 AND price = :v7 "
+        "AND offerid >= :v8 ORDER BY price, offerid LIMIT :v9) "
+        "SELECT sellerid, offerid, sellingasset, buyingasset, "
+        "amount, pricen, priced, flags, lastmodified "
+        "FROM (SELECT * FROM r1 UNION ALL SELECT * FROM r2) AS res "
+        "ORDER BY price, offerid LIMIT :v10";
 
+    std::string buyingAsset, sellingAsset;
+    buyingAsset = decoder::encode_b64(xdr::xdr_to_opaque(buying));
+    sellingAsset = decoder::encode_b64(xdr::xdr_to_opaque(selling));
+
+    double worseThanPrice =
+        (double)worseThan.price.n / (double)worseThan.price.d;
+    int64_t worseThanOfferID = worseThan.offerID + 1;
+
+    auto prep = mDatabase.getPreparedStatement(sql);
+    auto& st = prep.statement();
+    st.exchange(soci::use(sellingAsset));
+    st.exchange(soci::use(buyingAsset));
+    st.exchange(soci::use(worseThanPrice));
+    st.exchange(soci::use(numOffers));
+    st.exchange(soci::use(sellingAsset));
+    st.exchange(soci::use(buyingAsset));
+    st.exchange(soci::use(worseThanPrice));
+    st.exchange(soci::use(worseThanOfferID));
+    st.exchange(soci::use(numOffers));
+    st.exchange(soci::use(numOffers));
+
+    {
+        auto timer = mDatabase.getSelectTimer("offer");
+        return loadOffers(prep, offers);
+    }
+}
+
+bool
+isBetterOffer(OfferDescriptor const& lhs, OfferDescriptor const& rhs)
+{
     double lhsPrice = double(lhs.price.n) / double(lhs.price.d);
     double rhsPrice = double(rhs.price.n) / double(rhs.price.d);
     if (lhsPrice < rhsPrice)
@@ -118,6 +168,27 @@ isBetterOffer(LedgerEntry const& lhsEntry, LedgerEntry const& rhsEntry)
     {
         return false;
     }
+}
+
+bool
+isBetterOffer(OfferDescriptor const& lhs, LedgerEntry const& rhsEntry)
+{
+    auto const& rhs = rhsEntry.data.offer();
+    return isBetterOffer(lhs, {rhs.price, rhs.offerID});
+}
+
+// Note: The order induced by this function must match the order used in the
+// SQL query for loadBestOffers above.
+bool
+isBetterOffer(LedgerEntry const& lhsEntry, LedgerEntry const& rhsEntry)
+{
+    auto const& lhs = lhsEntry.data.offer();
+    auto const& rhs = rhsEntry.data.offer();
+
+    assert(lhs.buying == rhs.buying);
+    assert(lhs.selling == rhs.selling);
+
+    return isBetterOffer({lhs.price, lhs.offerID}, {rhs.price, rhs.offerID});
 }
 
 // Note: This function is currently only used in AllowTrustOpFrame, which means
@@ -165,9 +236,9 @@ processAsset(std::string const& asset)
     return res;
 }
 
-std::list<LedgerEntry>::const_iterator
+std::deque<LedgerEntry>::const_iterator
 LedgerTxnRoot::Impl::loadOffers(StatementContext& prep,
-                                std::list<LedgerEntry>& offers) const
+                                std::deque<LedgerEntry>& offers) const
 {
     std::string actIDStrKey;
     std::string sellingAsset, buyingAsset;
@@ -189,25 +260,19 @@ LedgerTxnRoot::Impl::loadOffers(StatementContext& prep,
     st.define_and_bind();
     st.execute(true);
 
-    auto iterNext = offers.cend();
+    size_t n = 0;
     while (st.got_data())
     {
+        ++n;
         oe.sellerID = KeyUtils::fromStrKey<PublicKey>(actIDStrKey);
         oe.selling = processAsset(sellingAsset);
         oe.buying = processAsset(buyingAsset);
 
-        if (iterNext == offers.cend())
-        {
-            iterNext = offers.emplace(iterNext, le);
-        }
-        else
-        {
-            offers.emplace_back(le);
-        }
+        offers.emplace_back(le);
         st.fetch();
     }
 
-    return iterNext;
+    return offers.cend() - n;
 }
 
 std::vector<LedgerEntry>
@@ -548,19 +613,17 @@ LedgerTxnRoot::Impl::dropOffers()
     mEntryCache.clear();
     mBestOffersCache.clear();
 
+    std::string coll = mDatabase.getSimpleCollationClause();
+
     mDatabase.getSession() << "DROP TABLE IF EXISTS offers;";
     mDatabase.getSession()
         << "CREATE TABLE offers"
-           "("
-           "sellerid         VARCHAR(56)  NOT NULL,"
-           "offerid          BIGINT       NOT NULL CHECK (offerid >= 0),"
-           "sellingassettype INT          NOT NULL,"
-           "sellingassetcode VARCHAR(12),"
-           "sellingissuer    VARCHAR(56),"
-           "buyingassettype  INT          NOT NULL,"
-           "buyingassetcode  VARCHAR(12),"
-           "buyingissuer     VARCHAR(56),"
-           "amount           BIGINT           NOT NULL CHECK (amount >= 0),"
+        << "("
+        << "sellerid         VARCHAR(56) " << coll << "NOT NULL,"
+        << "offerid          BIGINT           NOT NULL CHECK (offerid >= 0),"
+        << "sellingasset     TEXT " << coll << " NOT NULL,"
+        << "buyingasset      TEXT " << coll << " NOT NULL,"
+        << "amount           BIGINT           NOT NULL CHECK (amount >= 0),"
            "pricen           INT              NOT NULL,"
            "priced           INT              NOT NULL,"
            "price            DOUBLE PRECISION NOT NULL,"
@@ -568,19 +631,26 @@ LedgerTxnRoot::Impl::dropOffers()
            "lastmodified     INT              NOT NULL,"
            "PRIMARY KEY      (offerid)"
            ");";
-    mDatabase.getSession()
-        << "CREATE INDEX sellingissuerindex ON offers (sellingissuer);";
-    mDatabase.getSession()
-        << "CREATE INDEX buyingissuerindex ON offers (buyingissuer);";
-    mDatabase.getSession() << "CREATE INDEX priceindex ON offers (price);";
+    mDatabase.getSession() << "CREATE INDEX bestofferindex ON offers "
+                              "(sellingasset,buyingasset,price);";
 }
 
 class BulkLoadOffersOperation
     : public DatabaseTypeSpecificOperation<std::vector<LedgerEntry>>
 {
     Database& mDb;
+    uint32_t mLedgerVersion;
     std::vector<int64_t> mOfferIDs;
+    std::unordered_set<LedgerKey> mKeys;
     std::unordered_map<int64_t, AccountID> mSellerIDsByOfferID;
+
+    bool
+    shouldIncludeOffer(int64_t offerID, AccountID sellerID)
+    {
+        // Before protocol version 13, exclude offers where sellerID in
+        // LedgerKey doesn't match sellerID in LedgerEntry
+        return mLedgerVersion >= 13 || mSellerIDsByOfferID[offerID] == sellerID;
+    }
 
     std::vector<LedgerEntry>
     executeAndFetch(soci::statement& st)
@@ -611,9 +681,7 @@ class BulkLoadOffersOperation
         {
             auto pubKey = KeyUtils::fromStrKey<PublicKey>(sellerID);
 
-            // Exclude offers where sellerID in LedgerKey doesn't match sellerID
-            // in LedgerEntry
-            if (mSellerIDsByOfferID[offerID] == pubKey)
+            if (shouldIncludeOffer(offerID, pubKey))
             {
                 res.emplace_back();
                 auto& le = res.back();
@@ -639,8 +707,9 @@ class BulkLoadOffersOperation
 
   public:
     BulkLoadOffersOperation(Database& db,
-                            std::unordered_set<LedgerKey> const& keys)
-        : mDb(db)
+                            std::unordered_set<LedgerKey> const& keys,
+                            uint32_t ledgerVersion)
+        : mDb(db), mLedgerVersion(ledgerVersion)
     {
         mOfferIDs.reserve(keys.size());
         for (auto const& k : keys)
@@ -649,7 +718,10 @@ class BulkLoadOffersOperation
             if (k.offer().offerID >= 0)
             {
                 mOfferIDs.emplace_back(k.offer().offerID);
-                mSellerIDsByOfferID[mOfferIDs.back()] = k.offer().sellerID;
+                if (mLedgerVersion < 13)
+                {
+                    mSellerIDsByOfferID[mOfferIDs.back()] = k.offer().sellerID;
+                }
             }
         }
     }
@@ -663,8 +735,13 @@ class BulkLoadOffersOperation
             "FROM offers WHERE offerid IN carray(?, ?, 'int64')";
 
         auto prep = mDb.getPreparedStatement(sql);
-        auto sqliteStatement = dynamic_cast<soci::sqlite3_statement_backend*>(
-            prep.statement().get_backend());
+        auto be = prep.statement().get_backend();
+        if (be == nullptr)
+        {
+            throw std::runtime_error("no sql backend");
+        }
+        auto sqliteStatement =
+            dynamic_cast<soci::sqlite3_statement_backend*>(be);
         auto st = sqliteStatement->stmt_;
 
         sqlite3_reset(st);
@@ -699,142 +776,13 @@ LedgerTxnRoot::Impl::bulkLoadOffers(
 {
     if (!keys.empty())
     {
-        BulkLoadOffersOperation op(mDatabase, keys);
+        BulkLoadOffersOperation op(mDatabase, keys, mHeader->ledgerVersion);
         return populateLoadedEntries(
             keys, mDatabase.doDatabaseTypeSpecificOperation(op));
     }
     else
     {
         return {};
-    }
-}
-
-static void
-processAssetForSchemaUpgrade(Asset& asset, AssetType assetType,
-                             std::string const& issuerStr,
-                             soci::indicator const& issuerIndicator,
-                             std::string const& assetCode,
-                             soci::indicator const& assetCodeIndicator)
-{
-    asset.type(assetType);
-    if (assetType != ASSET_TYPE_NATIVE)
-    {
-        if ((assetCodeIndicator != soci::i_ok) ||
-            (issuerIndicator != soci::i_ok))
-        {
-            throw std::runtime_error("bad database state");
-        }
-
-        if (assetType == ASSET_TYPE_CREDIT_ALPHANUM12)
-        {
-            asset.alphaNum12().issuer =
-                KeyUtils::fromStrKey<PublicKey>(issuerStr);
-            strToAssetCode(asset.alphaNum12().assetCode, assetCode);
-        }
-        else if (assetType == ASSET_TYPE_CREDIT_ALPHANUM4)
-        {
-            asset.alphaNum4().issuer =
-                KeyUtils::fromStrKey<PublicKey>(issuerStr);
-            strToAssetCode(asset.alphaNum4().assetCode, assetCode);
-        }
-        else
-        {
-            throw std::runtime_error("bad database state");
-        }
-    }
-}
-
-static std::vector<LedgerEntry>
-loadAllOffersForSchemaUpgrade(Database& db)
-{
-    std::vector<LedgerEntry> offers;
-
-    std::string sql = "SELECT sellerid, offerid, "
-                      "sellingassettype, sellingassetcode, sellingissuer, "
-                      "buyingassettype, buyingassetcode, buyingissuer, "
-                      "amount, pricen, priced, flags, lastmodified "
-                      "FROM offers";
-    auto prep = db.getPreparedStatement(sql);
-
-    std::string actIDStrKey;
-    unsigned int sellingAssetType, buyingAssetType;
-    std::string sellingAssetCode, buyingAssetCode, sellingIssuerStrKey,
-        buyingIssuerStrKey;
-    soci::indicator sellingAssetCodeIndicator, buyingAssetCodeIndicator,
-        sellingIssuerIndicator, buyingIssuerIndicator;
-
-    LedgerEntry le;
-    le.data.type(OFFER);
-    OfferEntry& oe = le.data.offer();
-
-    auto& st = prep.statement();
-    st.exchange(soci::into(actIDStrKey));
-    st.exchange(soci::into(oe.offerID));
-    st.exchange(soci::into(sellingAssetType));
-    st.exchange(soci::into(sellingAssetCode, sellingAssetCodeIndicator));
-    st.exchange(soci::into(sellingIssuerStrKey, sellingIssuerIndicator));
-    st.exchange(soci::into(buyingAssetType));
-    st.exchange(soci::into(buyingAssetCode, buyingAssetCodeIndicator));
-    st.exchange(soci::into(buyingIssuerStrKey, buyingIssuerIndicator));
-    st.exchange(soci::into(oe.amount));
-    st.exchange(soci::into(oe.price.n));
-    st.exchange(soci::into(oe.price.d));
-    st.exchange(soci::into(oe.flags));
-    st.exchange(soci::into(le.lastModifiedLedgerSeq));
-    st.define_and_bind();
-    st.execute(true);
-    while (st.got_data())
-    {
-        oe.sellerID = KeyUtils::fromStrKey<PublicKey>(actIDStrKey);
-        processAssetForSchemaUpgrade(oe.selling, (AssetType)sellingAssetType,
-                                     sellingIssuerStrKey,
-                                     sellingIssuerIndicator, sellingAssetCode,
-                                     sellingAssetCodeIndicator);
-        processAssetForSchemaUpgrade(oe.buying, (AssetType)buyingAssetType,
-                                     buyingIssuerStrKey, buyingIssuerIndicator,
-                                     buyingAssetCode, buyingAssetCodeIndicator);
-
-        offers.emplace_back(le);
-        st.fetch();
-    }
-
-    return offers;
-}
-
-void
-LedgerTxnRoot::Impl::writeOffersIntoSimplifiedOffersTable()
-{
-    throwIfChild();
-    mEntryCache.clear();
-    mBestOffersCache.clear();
-
-    CLOG(INFO, "Ledger") << "Loading all offers";
-    auto const offers = stellar::loadAllOffersForSchemaUpgrade(mDatabase);
-
-    mDatabase.getSession() << "DROP TABLE IF EXISTS offers";
-    mDatabase.getSession()
-        << "CREATE TABLE offers"
-           "("
-           "sellerid         VARCHAR(56)      NOT NULL,"
-           "offerid          BIGINT           NOT NULL CHECK (offerid >= 0),"
-           "sellingasset     TEXT             NOT NULL,"
-           "buyingasset      TEXT             NOT NULL,"
-           "amount           BIGINT           NOT NULL CHECK (amount >= 0),"
-           "pricen           INT              NOT NULL,"
-           "priced           INT              NOT NULL,"
-           "price            DOUBLE PRECISION NOT NULL,"
-           "flags            INT              NOT NULL,"
-           "lastmodified     INT              NOT NULL,"
-           "PRIMARY KEY      (offerid)"
-           ");";
-    mDatabase.getSession() << "CREATE INDEX bestofferindex ON offers "
-                              "(sellingasset,buyingasset,price);";
-
-    if (!offers.empty())
-    {
-        BulkUpsertOffersOperation op(mDatabase, offers);
-        mDatabase.doDatabaseTypeSpecificOperation(op);
-        CLOG(INFO, "Ledger") << "Wrote " << offers.size() << " offer entries";
     }
 }
 }

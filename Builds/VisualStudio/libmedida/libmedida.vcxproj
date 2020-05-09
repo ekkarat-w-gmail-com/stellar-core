@@ -29,44 +29,44 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{274A9F25-F6AE-4484-B5D1-5812C1B7A48D}</ProjectGuid>
     <RootNamespace>libmedida</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0.15063.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
     <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugNoPostgres|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
     <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
     <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugNoPostgres|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
     <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
@@ -207,6 +207,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="..\..\..\lib\libmedida\src\medida\buckets.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\counter.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\histogram.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\meter.cc" />
@@ -222,12 +223,14 @@
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\reporting\util.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\stats\ewma.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\stats\exp_decay_sample.cc" />
+    <ClCompile Include="..\..\..\lib\libmedida\src\medida\stats\sliding_window_sample.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\stats\snapshot.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\stats\uniform_sample.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\timer.cc" />
     <ClCompile Include="..\..\..\lib\libmedida\src\medida\timer_context.cc" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\..\..\lib\libmedida\src\medida\buckets.h" />
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\counter.h" />
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\histogram.h" />
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\medida.h" />
@@ -245,6 +248,7 @@
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\stats\ewma.h" />
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\stats\exp_decay_sample.h" />
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\stats\sample.h" />
+    <ClInclude Include="..\..\..\lib\libmedida\src\medida\stats\sliding_window_sample.h" />
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\stats\snapshot.h" />
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\stats\uniform_sample.h" />
     <ClInclude Include="..\..\..\lib\libmedida\src\medida\summarizable_interface.h" />

@@ -4,7 +4,10 @@
 
 #include "main/ApplicationUtils.h"
 #include "bucket/Bucket.h"
+#include "bucket/BucketManager.h"
+#include "catchup/ApplyBucketsWork.h"
 #include "catchup/CatchupConfiguration.h"
+#include "database/Database.h"
 #include "history/HistoryArchive.h"
 #include "history/HistoryArchiveManager.h"
 #include "historywork/GetHistoryArchiveStateWork.h"
@@ -41,6 +44,11 @@ runWithConfig(Config cfg)
         cfg.FORCE_SCP = true;
     }
 
+    if (cfg.NODE_IS_VALIDATOR && cfg.DATABASE.value == "sqlite3://:memory:")
+    {
+        cfg.FORCE_SCP = true;
+    }
+
     LOG(INFO) << "Starting stellar-core " << STELLAR_CORE_VERSION;
     VirtualClock clock(VirtualClock::REAL_TIME);
     Application::pointer app;
@@ -62,17 +70,26 @@ runWithConfig(Config cfg)
 
         app->applyCfgCommands();
     }
-    catch (std::exception& e)
+    catch (std::exception const& e)
     {
         LOG(FATAL) << "Got an exception: " << e.what();
         LOG(FATAL) << REPORT_INTERNAL_BUG;
         return 1;
     }
-    auto& io = clock.getIOContext();
-    asio::io_context::work mainWork(io);
-    while (!io.stopped())
+
+    try
     {
-        clock.crank();
+        auto& io = clock.getIOContext();
+        asio::io_context::work mainWork(io);
+        while (!io.stopped())
+        {
+            clock.crank();
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG(FATAL) << "Got an exception: " << e.what();
+        throw; // propagate exception (core dump, etc)
     }
     return 0;
 }
@@ -122,18 +139,6 @@ httpCommand(std::string const& command, unsigned short port)
         LOG(INFO) << "http failed(" << code << ") port: " << port
                   << " command: " << command;
     }
-}
-
-void
-loadXdr(Config cfg, std::string const& bucketFile)
-{
-    VirtualClock clock;
-    cfg.setNoListen();
-    Application::pointer app = Application::create(clock, cfg, false);
-
-    uint256 zero;
-    Bucket bucket(bucketFile, zero);
-    bucket.apply(*app);
 }
 
 void
@@ -188,6 +193,79 @@ showOfflineInfo(Config cfg)
     app->reportInfo();
 }
 
+#ifdef BUILD_TESTS
+void
+loadXdr(Config cfg, std::string const& bucketFile)
+{
+    VirtualClock clock;
+    cfg.setNoListen();
+    Application::pointer app = Application::create(clock, cfg, false);
+
+    uint256 zero;
+    Bucket bucket(bucketFile, zero);
+    bucket.apply(*app);
+}
+
+int
+rebuildLedgerFromBuckets(Config cfg)
+{
+    VirtualClock clock(VirtualClock::REAL_TIME);
+    cfg.setNoListen();
+    Application::pointer app = Application::create(clock, cfg, false);
+
+    auto& ps = app->getPersistentState();
+    auto lcl = ps.getState(PersistentState::kLastClosedLedger);
+    auto hasStr = ps.getState(PersistentState::kHistoryArchiveState);
+    auto pass = ps.getState(PersistentState::kNetworkPassphrase);
+
+    LOG(INFO) << "Re-initializing database ledger tables.";
+    auto& db = app->getDatabase();
+    auto& session = app->getDatabase().getSession();
+    soci::transaction tx(session);
+
+    db.initialize();
+    db.upgradeToCurrentSchema();
+    db.clearPreparedStatementCache();
+    LOG(INFO) << "Re-initialized database ledger tables.";
+
+    LOG(INFO) << "Re-storing persistent state.";
+    ps.setState(PersistentState::kLastClosedLedger, lcl);
+    ps.setState(PersistentState::kHistoryArchiveState, hasStr);
+    ps.setState(PersistentState::kNetworkPassphrase, pass);
+
+    LOG(INFO) << "Applying buckets from LCL bucket list.";
+    std::map<std::string, std::shared_ptr<Bucket>> localBuckets;
+    auto& ws = app->getWorkScheduler();
+
+    HistoryArchiveState has;
+    has.fromString(hasStr);
+    has.prepareForPublish(*app);
+
+    auto applyBucketsWork = ws.executeWork<ApplyBucketsWork>(
+        localBuckets, has, Config::CURRENT_LEDGER_PROTOCOL_VERSION);
+    auto ok = applyBucketsWork->getState() == BasicWork::State::WORK_SUCCESS;
+    if (ok)
+    {
+        tx.commit();
+        LOG(INFO) << "*";
+        LOG(INFO) << "* Rebuilt ledger from buckets successfully.";
+        LOG(INFO) << "*";
+    }
+    else
+    {
+        tx.rollback();
+        LOG(INFO) << "*";
+        LOG(INFO) << "* Rebuild of ledger failed.";
+        LOG(INFO) << "*";
+    }
+
+    app->gracefulStop();
+    while (clock.crank(true))
+        ;
+    return ok ? 0 : 1;
+}
+#endif
+
 int
 reportLastHistoryCheckpoint(Config cfg, std::string const& outputFile)
 {
@@ -195,15 +273,15 @@ reportLastHistoryCheckpoint(Config cfg, std::string const& outputFile)
     cfg.setNoListen();
     Application::pointer app = Application::create(clock, cfg, false);
 
-    auto state = HistoryArchiveState{};
     auto& wm = app->getWorkScheduler();
     auto getHistoryArchiveStateWork =
-        wm.executeWork<GetHistoryArchiveStateWork>(state);
+        wm.executeWork<GetHistoryArchiveStateWork>();
 
     auto ok = getHistoryArchiveStateWork->getState() ==
               BasicWork::State::WORK_SUCCESS;
     if (ok)
     {
+        auto state = getHistoryArchiveStateWork->getHistoryArchiveState();
         std::string filename = outputFile.empty() ? "-" : outputFile;
 
         if (filename == "-")
@@ -284,19 +362,20 @@ writeCatchupInfo(Json::Value const& catchupInfo, std::string const& outputFile)
 
 int
 catchup(Application::pointer app, CatchupConfiguration cc,
-        Json::Value& catchupInfo)
+        Json::Value& catchupInfo, std::shared_ptr<HistoryArchive> archive)
 {
     app->start();
 
     try
     {
-        app->getLedgerManager().startCatchup(cc);
+        app->getLedgerManager().startCatchup(cc, archive);
     }
     catch (std::invalid_argument const&)
     {
         LOG(INFO) << "*";
         LOG(INFO) << "* Target ledger " << cc.toLedger()
-                  << " is not newer than last closed ledger"
+                  << " is not newer than last closed ledger "
+                  << app->getLedgerManager().getLastClosedLedgerNum()
                   << " - nothing to do";
         LOG(INFO) << "* If you really want to catchup to " << cc.toLedger()
                   << " run stellar-core new-db";
@@ -311,29 +390,26 @@ catchup(Application::pointer app, CatchupConfiguration cc,
     auto done = false;
     while (!done && clock.crank(true))
     {
-        switch (app->getLedgerManager().getState())
+        switch (app->getCatchupManager().getCatchupWorkState())
         {
-        case LedgerManager::LM_BOOTING_STATE:
+        case BasicWork::State::WORK_ABORTED:
+        case BasicWork::State::WORK_FAILURE:
         {
             done = true;
             break;
         }
-        case LedgerManager::LM_SYNCED_STATE:
+        case BasicWork::State::WORK_SUCCESS:
         {
             done = true;
             synced = true;
             break;
         }
-        case LedgerManager::LM_CATCHING_UP_STATE:
+        case BasicWork::State::WORK_RUNNING:
+        case BasicWork::State::WORK_WAITING:
         {
-            if (app->getLedgerManager().getCatchupState() ==
-                LedgerManager::CatchupState::NONE)
-            {
-                abort();
-            }
             break;
         }
-        case LedgerManager::LM_NUM_STATE:
+        default:
             abort();
         }
     }
@@ -363,8 +439,7 @@ publish(Application::pointer app)
     asio::io_context::work mainWork(io);
 
     auto lcl = app->getLedgerManager().getLastClosedLedgerNum();
-    auto isCheckpoint =
-        lcl == app->getHistoryManager().checkpointContainingLedger(lcl);
+    auto isCheckpoint = app->getHistoryManager().isLastLedgerInCheckpoint(lcl);
     auto expectedPublishQueueSize = isCheckpoint ? 1 : 0;
 
     app->getHistoryManager().publishQueuedHistory();
@@ -373,6 +448,9 @@ publish(Application::pointer app)
            clock.crank(true))
     {
     }
+
+    // Cleanup buckets not referenced by publish queue anymore
+    app->getBucketManager().forgetUnreferencedBuckets();
 
     LOG(INFO) << "*";
     LOG(INFO) << "* Publish finished.";

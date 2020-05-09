@@ -24,6 +24,7 @@
 #include "invariant/InvariantManager.h"
 #include "invariant/LedgerEntryIsValid.h"
 #include "invariant/LiabilitiesMatchOffers.h"
+#include "ledger/InMemoryLedgerTxnRoot.h"
 #include "ledger/LedgerManager.h"
 #include "ledger/LedgerTxn.h"
 #include "main/CommandHandler.h"
@@ -75,8 +76,6 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
     , mAppStateCurrent(mMetrics->NewCounter({"app", "state", "current"}))
     , mPostOnMainThreadDelay(
           mMetrics->NewTimer({"app", "post-on-main-thread", "delay"}))
-    , mPostOnMainThreadWithDelayDelay(mMetrics->NewTimer(
-          {"app", "post-on-main-thread-with-delay", "delay"}))
     , mPostOnBackgroundThreadDelay(
           mMetrics->NewTimer({"app", "post-on-background-thread", "delay"}))
     , mStartedOn(clock.now())
@@ -96,6 +95,13 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
         if (!ec)
         {
             LOG(INFO) << "got signal " << sig << ", shutting down";
+
+#ifdef BUILD_TESTS
+            if (mConfig.TEST_CASES_ENABLED)
+            {
+                exit(1);
+            }
+#endif
             this->gracefulStop();
         }
     });
@@ -128,14 +134,23 @@ ApplicationImpl::initialize(bool createNewDB)
     mHistoryManager = HistoryManager::create(*this);
     mInvariantManager = createInvariantManager();
     mMaintainer = std::make_unique<Maintainer>(*this);
-    mProcessManager = ProcessManager::create(*this);
     mCommandHandler = std::make_unique<CommandHandler>(*this);
     mWorkScheduler = WorkScheduler::create(*this);
     mBanManager = BanManager::create(*this);
     mStatusManager = std::make_unique<StatusManager>();
-    mLedgerTxnRoot = std::make_unique<LedgerTxnRoot>(
-        *mDatabase, mConfig.ENTRY_CACHE_SIZE, mConfig.BEST_OFFERS_CACHE_SIZE,
-        mConfig.PREFETCH_BATCH_SIZE);
+
+    if (getConfig().MODE_USES_IN_MEMORY_LEDGER)
+    {
+        mLedgerTxnRoot = std::make_unique<InMemoryLedgerTxnRoot>();
+        mNeverCommittingLedgerTxn =
+            std::make_unique<LedgerTxn>(*mLedgerTxnRoot);
+    }
+    else
+    {
+        mLedgerTxnRoot = std::make_unique<LedgerTxnRoot>(
+            *mDatabase, mConfig.ENTRY_CACHE_SIZE,
+            mConfig.BEST_OFFERS_CACHE_SIZE, mConfig.PREFETCH_BATCH_SIZE);
+    }
 
     BucketListIsConsistentWithDatabase::registerInvariant(*this);
     AccountSubEntriesCountIsValid::registerInvariant(*this);
@@ -153,6 +168,10 @@ ApplicationImpl::initialize(bool createNewDB)
         upgradeDB();
     }
 
+    // Subtle: process manager should come to existence _after_ BucketManager
+    // initialization and newDB run, as it relies on tmp dir created in the
+    // constructor
+    mProcessManager = ProcessManager::create(*this);
     LOG(DEBUG) << "Application constructed";
 }
 
@@ -161,6 +180,7 @@ ApplicationImpl::newDB()
 {
     mDatabase->initialize();
     mDatabase->upgradeToCurrentSchema();
+    mBucketManager->dropAll();
     mLedgerManager->startNewLedger();
 }
 
@@ -267,12 +287,26 @@ ApplicationImpl::getJsonInfo()
     }
 
     auto& herder = getHerder();
-    auto q =
-        herder.getJsonQuorumInfo(getConfig().NODE_SEED.getPublicKey(), true,
-                                 false, herder.getCurrentLedgerSeq());
-    if (q["slots"].size() != 0)
+
+    auto& quorumInfo = info["quorum"];
+
+    // Try to get quorum set info for the previous ledger closed by the
+    // network.
+    if (herder.getCurrentLedgerSeq() > 1)
     {
-        info["quorum"] = q["slots"];
+        quorumInfo =
+            herder.getJsonQuorumInfo(getConfig().NODE_SEED.getPublicKey(), true,
+                                     false, herder.getCurrentLedgerSeq() - 1);
+    }
+
+    // If the quorum set info for the previous ledger is missing, use the
+    // current ledger
+    auto qset = quorumInfo.get("qset", "");
+    if (quorumInfo.empty() || qset.empty())
+    {
+        quorumInfo =
+            herder.getJsonQuorumInfo(getConfig().NODE_SEED.getPublicKey(), true,
+                                     false, herder.getCurrentLedgerSeq());
     }
 
     auto invariantFailures = getInvariantManager().getJsonInfo();
@@ -348,24 +382,37 @@ ApplicationImpl::start()
         mConfig.FORCE_SCP = true;
     }
 
+    if (mConfig.METADATA_OUTPUT_STREAM != "" && mConfig.NODE_IS_VALIDATOR)
+    {
+        LOG(ERROR) << "Starting stellar-core with METADATA_OUTPUT_STREAM "
+                      "requires NODE_IS_VALIDATOR to be unset";
+        throw std::invalid_argument("NODE_IS_VALIDATOR is set");
+    }
+
+    if (mConfig.NODE_IS_VALIDATOR)
+    {
+        if (mConfig.MODE_USES_IN_MEMORY_LEDGER)
+        {
+            LOG(ERROR) << "Starting stellar-core with in-memory ledger mode "
+                          "requires NODE_IS_VALIDATOR to be unset";
+            throw std::invalid_argument("NODE_IS_VALIDATOR is set");
+        }
+    }
+
+    if (getHistoryArchiveManager().hasAnyWritableHistoryArchive())
+    {
+        if (!mConfig.MODE_STORES_HISTORY)
+        {
+            LOG(ERROR) << "Starting stellar-core in a mode that does not store "
+                          "history data requires all history archives to be "
+                          "non-writable";
+            throw std::invalid_argument("some history archives are writable");
+        }
+    }
+
     if (mConfig.QUORUM_SET.threshold == 0)
     {
         throw std::invalid_argument("Quorum not configured");
-    }
-    if (!isQuorumSetSane(mConfig.QUORUM_SET, !mConfig.UNSAFE_QUORUM))
-    {
-        std::string err("Invalid QUORUM_SET: duplicate entry or bad threshold "
-                        "(should be between ");
-        if (mConfig.UNSAFE_QUORUM)
-        {
-            err = err + "1";
-        }
-        else
-        {
-            err = err + "51";
-        }
-        err = err + " and 100)";
-        throw std::invalid_argument(err);
     }
 
     mConfig.logBasicInfo();
@@ -437,6 +484,10 @@ ApplicationImpl::gracefulStop()
     if (mBucketManager)
     {
         mBucketManager->shutdown();
+    }
+    if (mHerder)
+    {
+        mHerder->shutdown();
     }
 
     mStoppingTimer.expires_from_now(
@@ -627,6 +678,10 @@ ApplicationImpl::syncOwnMetrics()
     // Similarly, flush global process-table stats.
     mMetrics->NewCounter({"process", "memory", "handles"})
         .set_count(mProcessManager->getNumRunningProcesses());
+
+    // Update ioservice related metrics
+    mMetrics->NewCounter({"process", "ioservice", "queue"})
+        .set_count(static_cast<int64_t>(getClock().getExecutionQueueSize()));
 }
 
 void
@@ -634,6 +689,7 @@ ApplicationImpl::syncAllMetrics()
 {
     mHerder->syncMetrics();
     mLedgerManager->syncMetrics();
+    mCatchupManager->syncMetrics();
     syncOwnMetrics();
 }
 
@@ -767,26 +823,15 @@ ApplicationImpl::getWorkerIOContext()
 
 void
 ApplicationImpl::postOnMainThread(std::function<void()>&& f,
-                                  std::string jobName)
+                                  VirtualClock::ExecutionCategory&& id)
 {
-    LogSlowExecution isSlow{std::move(jobName), LogSlowExecution::Mode::MANUAL,
+    LogSlowExecution isSlow{id.mName, LogSlowExecution::Mode::MANUAL,
                             "executed after"};
-    mVirtualClock.postToCurrentCrank([ this, f = std::move(f), isSlow ]() {
+    mVirtualClock.postToExecutionQueue([ this, f = std::move(f), isSlow ]() {
         mPostOnMainThreadDelay.Update(isSlow.checkElapsedTime());
         f();
-    });
-}
-
-void
-ApplicationImpl::postOnMainThreadWithDelay(std::function<void()>&& f,
-                                           std::string jobName)
-{
-    LogSlowExecution isSlow{std::move(jobName), LogSlowExecution::Mode::MANUAL,
-                            "executed after"};
-    mVirtualClock.postToNextCrank([ this, f = std::move(f), isSlow ]() {
-        mPostOnMainThreadWithDelayDelay.Update(isSlow.checkElapsedTime());
-        f();
-    });
+    },
+                                       std::move(id));
 }
 
 void
@@ -834,10 +879,11 @@ ApplicationImpl::createLedgerManager()
     return LedgerManager::create(*this);
 }
 
-LedgerTxnRoot&
+AbstractLedgerTxnParent&
 ApplicationImpl::getLedgerTxnRoot()
 {
     assertThreadIsMain();
-    return *mLedgerTxnRoot;
+    return mConfig.MODE_USES_IN_MEMORY_LEDGER ? *mNeverCommittingLedgerTxn
+                                              : *mLedgerTxnRoot;
 }
 }

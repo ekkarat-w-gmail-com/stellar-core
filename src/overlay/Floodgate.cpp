@@ -43,7 +43,7 @@ Floodgate::clearBelow(uint32_t currentLedger)
         // give one ledger of leeway
         if (it->second->mLedgerSeq + 10 < currentLedger)
         {
-            mFloodMap.erase(it++);
+            it = mFloodMap.erase(it);
         }
         else
         {
@@ -54,13 +54,13 @@ Floodgate::clearBelow(uint32_t currentLedger)
 }
 
 bool
-Floodgate::addRecord(StellarMessage const& msg, Peer::pointer peer)
+Floodgate::addRecord(StellarMessage const& msg, Peer::pointer peer, Hash& index)
 {
+    index = sha256(xdr::xdr_to_opaque(msg));
     if (mShuttingDown)
     {
         return false;
     }
-    Hash index = sha256(xdr::xdr_to_opaque(msg));
     auto result = mFloodMap.find(index);
     if (result == mFloodMap.end())
     { // we have never seen this message
@@ -85,7 +85,6 @@ Floodgate::broadcast(StellarMessage const& msg, bool force)
         return;
     }
     Hash index = sha256(xdr::xdr_to_opaque(msg));
-    CLOG(TRACE, "Overlay") << "broadcast " << hexAbbrev(index);
 
     auto result = mFloodMap.find(index);
     if (result == mFloodMap.end() || force)
@@ -101,14 +100,16 @@ Floodgate::broadcast(StellarMessage const& msg, bool force)
     // make a copy, in case peers gets modified
     auto peers = mApp.getOverlayManager().getAuthenticatedPeers();
 
+    bool log = true;
     for (auto peer : peers)
     {
         assert(peer.second->isAuthenticated());
         if (peersTold.find(peer.second->toString()) == peersTold.end())
         {
             mSendFromBroadcast.Mark();
-            peer.second->sendMessage(msg);
+            peer.second->sendMessage(msg, log);
             peersTold.insert(peer.second->toString());
+            log = false;
         }
     }
     CLOG(TRACE, "Overlay") << "broadcast " << hexAbbrev(index) << " told "
@@ -140,5 +141,29 @@ Floodgate::shutdown()
 {
     mShuttingDown = true;
     mFloodMap.clear();
+}
+
+void
+Floodgate::forgetRecord(Hash const& h)
+{
+    mFloodMap.erase(h);
+}
+
+void
+Floodgate::updateRecord(StellarMessage const& oldMsg,
+                        StellarMessage const& newMsg)
+{
+    Hash oldHash = sha256(xdr::xdr_to_opaque(oldMsg));
+    Hash newHash = sha256(xdr::xdr_to_opaque(newMsg));
+
+    auto oldIter = mFloodMap.find(oldHash);
+    if (oldIter != mFloodMap.end())
+    {
+        auto record = oldIter->second;
+        record->mMessage = newMsg;
+
+        mFloodMap.erase(oldIter);
+        mFloodMap.emplace(newHash, record);
+    }
 }
 }

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "util/Logging.h"
+#include "util/format.h"
 #include <chrono>
 
 class LogSlowExecution
@@ -19,7 +20,7 @@ class LogSlowExecution
 
     LogSlowExecution(
         std::string eventName, Mode mode = Mode::AUTOMATIC_RAII,
-        std::string message = "hung for",
+        std::string message = "took",
         std::chrono::milliseconds threshold = std::chrono::seconds(1))
         : mStart(std::chrono::system_clock::now())
         , mName(std::move(eventName))
@@ -41,11 +42,22 @@ class LogSlowExecution
         auto finish = std::chrono::system_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             finish - mStart);
-        auto tooSlow = elapsed > mThreshold;
 
-        LOG_IF(tooSlow, INFO)
-            << "'" << mName << "' " << mMessage << " "
-            << static_cast<float>(elapsed.count()) / 1000 << " s";
+        if (elapsed > mThreshold)
+        {
+            auto msg = fmt::format("'{}' {} {} s", mName, mMessage,
+                                   static_cast<float>(elapsed.count()) / 1000);
+            // if we're 10 times over the threshold, log with INFO, otherwise
+            // use DEBUG
+            if (elapsed > mThreshold * 10)
+            {
+                CLOG(INFO, "Perf") << msg;
+            }
+            else
+            {
+                CLOG(DEBUG, "Perf") << msg;
+            }
+        }
         return elapsed;
     }
 

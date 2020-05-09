@@ -60,11 +60,21 @@ transactionTest(Application::pointer app)
 
     session << "SELECT x FROM test", soci::into(b);
     CHECK(a == b);
+    session << "DROP TABLE test";
 }
 
 TEST_CASE("database smoketest", "[db]")
 {
     Config const& cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE);
+
+    VirtualClock clock;
+    Application::pointer app = createTestApplication(clock, cfg);
+    transactionTest(app);
+}
+
+TEST_CASE("database on-disk smoketest", "[db]")
+{
+    Config const& cfg = getTestConfig(0, Config::TESTDB_ON_DISK_SQLITE);
 
     VirtualClock clock;
     Application::pointer app = createTestApplication(clock, cfg);
@@ -89,6 +99,7 @@ checkMVCCIsolation(Application::pointer app)
 
     auto& sess1 = app->getDatabase().getSession();
 
+    sess1 << "DROP TABLE IF EXISTS test";
     sess1 << "CREATE TABLE test (x INTEGER)";
     sess1 << "INSERT INTO test (x) VALUES (:v)", soci::use(v0);
 
@@ -178,6 +189,7 @@ checkMVCCIsolation(Application::pointer app)
     CLOG(DEBUG, "Database") << "Checking tx1 write committed";
     sess1 << "SELECT x FROM test", soci::into(s1r3);
     CHECK(s1r3 == tx1v2);
+    sess1 << "DROP TABLE test";
 }
 
 TEST_CASE("sqlite MVCC test", "[db]")

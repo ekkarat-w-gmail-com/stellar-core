@@ -14,7 +14,12 @@
 
 #ifdef _WIN32
 #include <direct.h>
-#include <filesystem>
+
+// Latest version of VC++ complains without this define (confused by C++ 17)
+#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING 1
+#include <experimental/filesystem>
+
+#include <io.h>
 #else
 #include <dirent.h>
 #include <sys/resource.h>
@@ -77,6 +82,56 @@ unlockFile(std::string const& path)
     }
 }
 
+void
+flushFileChanges(native_handle_t fh)
+{
+    if (FlushFileBuffers(fh) == FALSE)
+    {
+        FileSystemException::failWithGetLastError(
+            "fs::flushFileChanges() failed on _get_osfhandle(): ");
+    }
+}
+
+bool
+shouldUseRandomAccessHandle(std::string const& path)
+{
+    // Named pipes use stream mode, everything else uses random access.
+    return path.find("\\\\.\\pipe\\") != 0;
+}
+
+native_handle_t
+openFileToWrite(std::string const& path)
+{
+    HANDLE h = ::CreateFile(
+        path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,                   // DesiredAccess
+        FILE_SHARE_READ | FILE_SHARE_WRITE,             // ShareMode
+        NULL,                                           // SecurityAttributes
+        CREATE_ALWAYS,                                  // CreationDisposition
+        (FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED), // FlagsAndAttributes
+        NULL);                                          // TemplateFile
+
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        FileSystemException::failWithGetLastError(
+            std::string("fs::openFileToWrite() failed on CreateFile(\"") +
+            path + std::string("\"): "));
+    }
+    return h;
+}
+
+bool
+durableRename(std::string const& src, std::string const& dst,
+              std::string const& dir)
+{
+    if (MoveFileExA(src.c_str(), dst.c_str(), MOVEFILE_WRITE_THROUGH) == 0)
+    {
+        FileSystemException::failWithGetLastError(
+            "fs::durableRename() failed on MoveFileExA(): ");
+    }
+    return true;
+}
+
 bool
 exists(std::string const& name)
 {
@@ -110,17 +165,8 @@ mkdir(std::string const& name)
 void
 deltree(std::string const& d)
 {
-    SHFILEOPSTRUCT s = {0};
-    std::string from = d;
-    from.push_back('\0');
-    from.push_back('\0');
-    s.wFunc = FO_DELETE;
-    s.pFrom = from.data();
-    s.fFlags = FOF_NO_UI;
-    if (SHFileOperation(&s) != 0)
-    {
-        throw FileSystemException("SHFileOperation failed in deltree");
-    }
+    namespace fs = std::experimental::filesystem;
+    fs::remove_all(fs::path(d));
 }
 
 std::vector<std::string>
@@ -201,6 +247,82 @@ unlockFile(std::string const& path)
     {
         throw std::runtime_error("file was not locked");
     }
+}
+
+void
+flushFileChanges(native_handle_t fd)
+{
+    while (fsync(fd) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(
+            "fs::flushFileChanges() failed on fsync(): ");
+    }
+}
+
+bool
+shouldUseRandomAccessHandle(std::string const& path)
+{
+    return false;
+}
+
+native_handle_t
+openFileToWrite(std::string const& path)
+{
+    int fd;
+    while ((fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644)) ==
+           -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(std::string("fs::openFile(\"") +
+                                           path + "\") failed: ");
+    }
+    return fd;
+}
+
+bool
+durableRename(std::string const& src, std::string const& dst,
+              std::string const& dir)
+{
+    if (rename(src.c_str(), dst.c_str()) != 0)
+    {
+        return false;
+    }
+    int dfd;
+    while ((dfd = open(dir.c_str(), O_RDONLY)) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(
+            std::string("Failed to open directory ") + dir + " :");
+    }
+    while (fsync(dfd) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(
+            std::string("Failed to fsync directory ") + dir + " :");
+    }
+    while (close(dfd) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(
+            std::string("Failed to close directory ") + dir + " :");
+    }
+    return true;
 }
 
 bool
@@ -352,7 +474,8 @@ hexStr(uint32_t checkpointNum)
 std::string
 hexDir(std::string const& hexStr)
 {
-    std::regex rx("([[:xdigit:]]{2})([[:xdigit:]]{2})([[:xdigit:]]{2}).*");
+    static const std::regex rx(
+        "([[:xdigit:]]{2})([[:xdigit:]]{2})([[:xdigit:]]{2}).*");
     std::smatch sm;
     bool matched = std::regex_match(hexStr, sm, rx);
     assert(matched);
@@ -383,7 +506,7 @@ remoteName(std::string const& type, std::string const& hexStr,
 void
 checkGzipSuffix(std::string const& filename)
 {
-    std::string suf(".gz");
+    static const std::string suf(".gz");
     if (!(filename.size() >= suf.size() &&
           equal(suf.rbegin(), suf.rend(), filename.rbegin())))
     {
@@ -394,7 +517,7 @@ checkGzipSuffix(std::string const& filename)
 void
 checkNoGzipSuffix(std::string const& filename)
 {
-    std::string suf(".gz");
+    static const std::string suf(".gz");
     if (filename.size() >= suf.size() &&
         equal(suf.rbegin(), suf.rend(), filename.rbegin()))
     {

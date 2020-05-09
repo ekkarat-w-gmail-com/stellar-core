@@ -40,7 +40,7 @@ class CommandHandler;
 class WorkScheduler;
 class BanManager;
 class StatusManager;
-class LedgerTxnRoot;
+class AbstractLedgerTxnParent;
 
 #ifdef BUILD_TESTS
 class LoadGenerator;
@@ -79,7 +79,7 @@ void validateNetworkPassphrase(std::shared_ptr<Application> app);
  * configuration variables, including cryptographic keys, network ports, log
  * files, directories and the like. A local copy of the Config object is made on
  * construction of each Application, after which the local copy cannot be
- * further altered; the Application should be destroyed and recreted if any
+ * further altered; the Application should be destroyed and recreated if any
  * change to configuration is desired.
  *
  *
@@ -121,6 +121,7 @@ void validateNetworkPassphrase(std::shared_ptr<Application> app);
  * thread's io_context (held in the VirtualClock), or else deliver their results
  * to the Application through std::futures or similar standard
  * thread-synchronization primitives.
+ *
  */
 
 class Application
@@ -218,9 +219,7 @@ class Application
     virtual asio::io_context& getWorkerIOContext() = 0;
 
     virtual void postOnMainThread(std::function<void()>&& f,
-                                  std::string jobName) = 0;
-    virtual void postOnMainThreadWithDelay(std::function<void()>&& f,
-                                           std::string jobName) = 0;
+                                  VirtualClock::ExecutionCategory&& jobID) = 0;
     virtual void postOnBackgroundThread(std::function<void()>&& f,
                                         std::string jobName) = 0;
 
@@ -274,10 +273,10 @@ class Application
     // instances
     virtual Hash const& getNetworkID() const = 0;
 
-    virtual LedgerTxnRoot& getLedgerTxnRoot() = 0;
+    virtual AbstractLedgerTxnParent& getLedgerTxnRoot() = 0;
 
     // Factory: create a new Application object bound to `clock`, with a local
-    // copy made of `cfg`.
+    // copy made of `cfg`
     static pointer create(VirtualClock& clock, Config const& cfg,
                           bool newDB = true);
     template <typename T>

@@ -76,6 +76,7 @@ Simulation::addNode(SecretKey nodeKey, SCPQuorumSet qSet, Config const* cfg2,
                     : std::make_shared<Config>(newConfig());
     cfg->adjust();
     cfg->NODE_SEED = nodeKey;
+    cfg->MANUAL_CLOSE = false;
 
     if (mQuorumSetAdjuster)
     {
@@ -86,7 +87,10 @@ Simulation::addNode(SecretKey nodeKey, SCPQuorumSet qSet, Config const* cfg2,
         cfg->QUORUM_SET = qSet;
     }
 
-    cfg->RUN_STANDALONE = (mMode == OVER_LOOPBACK);
+    if (mMode == OVER_TCP)
+    {
+        cfg->RUN_STANDALONE = false;
+    }
 
     auto clock =
         make_shared<VirtualClock>(mVirtualClockMode ? VirtualClock::VIRTUAL_TIME
@@ -132,13 +136,13 @@ Simulation::removeNode(NodeID const& id)
     {
         auto node = it->second;
         mNodes.erase(it);
+        node.mApp->gracefulStop();
+        while (node.mClock->crank(false) > 0)
+            ;
         if (mMode == OVER_LOOPBACK)
         {
             dropAllConnections(id);
         }
-        node.mApp->gracefulStop();
-        while (node.mClock->crank(false) > 0)
-            ;
     }
 }
 
@@ -147,12 +151,21 @@ Simulation::dropAllConnections(NodeID const& id)
 {
     if (mMode == OVER_LOOPBACK)
     {
+        assert(mPendingConnections.empty());
         mLoopbackConnections.erase(
             std::remove_if(mLoopbackConnections.begin(),
                            mLoopbackConnections.end(),
                            [&](std::shared_ptr<LoopbackPeerConnection> c) {
-                               return c->getAcceptor()->getPeerID() == id ||
-                                      c->getInitiator()->getPeerID() == id;
+                               // use app's IDs here as connections may be
+                               // incomplete
+                               return c->getAcceptor()
+                                              ->getApp()
+                                              .getConfig()
+                                              .NODE_SEED.getPublicKey() == id ||
+                                      c->getInitiator()
+                                              ->getApp()
+                                              .getConfig()
+                                              .NODE_SEED.getPublicKey() == id;
                            }),
             mLoopbackConnections.end());
     }
@@ -212,6 +225,26 @@ Simulation::addLoopbackConnection(NodeID initiator, NodeID acceptor)
     }
 }
 
+std::shared_ptr<LoopbackPeerConnection>
+Simulation::getLoopbackConnection(NodeID const& initiator,
+                                  NodeID const& acceptor)
+{
+    auto it = std::find_if(
+        std::begin(mLoopbackConnections), std::end(mLoopbackConnections),
+        [&](std::shared_ptr<LoopbackPeerConnection> const& conn) {
+            return conn->getInitiator()
+                           ->getApp()
+                           .getConfig()
+                           .NODE_SEED.getPublicKey() == initiator &&
+                   conn->getAcceptor()
+                           ->getApp()
+                           .getConfig()
+                           .NODE_SEED.getPublicKey() == acceptor;
+        });
+
+    return it == std::end(mLoopbackConnections) ? nullptr : *it;
+}
+
 void
 Simulation::dropLoopbackConnection(NodeID initiator, NodeID acceptor)
 {
@@ -259,7 +292,6 @@ Simulation::startAllNodes()
         if (app->getState() == Application::APP_CREATED_STATE)
         {
             app->start();
-            app->getLoadGenerator().updateMinBalance();
         }
     }
 
@@ -497,14 +529,6 @@ Simulation::crankForAtLeast(VirtualClock::duration seconds, bool finalCrank)
 }
 
 void
-Simulation::crankUntilSync(Application& app, VirtualClock::duration timeout,
-                           bool finalCrank)
-{
-    crankUntil([&]() { return this->accountsOutOfSyncWithDb(app).empty(); },
-               timeout, finalCrank);
-}
-
-void
 Simulation::crankUntil(function<bool()> const& predicate,
                        VirtualClock::duration timeout, bool finalCrank)
 {
@@ -583,32 +607,6 @@ Simulation::crankUntil(VirtualClock::time_point timePoint, bool finalCrank)
     {
         stopAllNodes();
     }
-}
-
-vector<LoadGenerator::TestAccountPtr>
-Simulation::accountsOutOfSyncWithDb(Application& mainApp)
-{
-    vector<LoadGenerator::TestAccountPtr> result;
-    int iApp = 0;
-
-    for (auto const& p : mNodes)
-    {
-        iApp++;
-        vector<LoadGenerator::TestAccountPtr> res;
-        auto app = p.second.mApp;
-        res = mainApp.getLoadGenerator().checkAccountSynced(*app);
-        if (!res.empty())
-        {
-            LOG(DEBUG) << "On node " << iApp
-                       << " some accounts are not in sync.";
-        }
-        else
-        {
-            result.insert(result.end(), res.begin(), res.end());
-        }
-    }
-    LOG(INFO) << "Ledger has not yet caught up to the simulation.";
-    return result;
 }
 
 Config

@@ -71,9 +71,9 @@ void validateTxResults(TransactionFramePtr const& tx, Application& app,
                        ValidationResult validationResult,
                        TransactionResult const& applyResult = {});
 
-TxSetResultMeta closeLedgerOn(Application& app, uint32 ledgerSeq, int day,
-                              int month, int year,
-                              std::vector<TransactionFramePtr> const& txs = {});
+TxSetResultMeta
+closeLedgerOn(Application& app, uint32 ledgerSeq, int day, int month, int year,
+              std::vector<TransactionFrameBasePtr> const& txs = {});
 
 SecretKey getRoot(Hash const& networkID);
 
@@ -90,14 +90,23 @@ xdr::xvector<Signer, 20> getAccountSigners(PublicKey const& k,
                                            Application& app);
 
 TransactionFramePtr
-transactionFromOperations(Application& app, SecretKey const& from,
-                          SequenceNumber seq,
-                          std::vector<Operation> const& ops);
+transactionFromOperationsV0(Application& app, SecretKey const& from,
+                            SequenceNumber seq,
+                            std::vector<Operation> const& ops, int fee = 0);
+TransactionFramePtr
+transactionFromOperationsV1(Application& app, SecretKey const& from,
+                            SequenceNumber seq,
+                            std::vector<Operation> const& ops, int fee = 0);
+TransactionFramePtr transactionFromOperations(Application& app,
+                                              SecretKey const& from,
+                                              SequenceNumber seq,
+                                              std::vector<Operation> const& ops,
+                                              int fee = 0);
 
 Operation changeTrust(Asset const& asset, int64_t limit);
 
 Operation allowTrust(PublicKey const& trustor, Asset const& asset,
-                     bool authorize);
+                     uint32_t authorize);
 
 Operation inflation();
 
@@ -125,6 +134,11 @@ TransactionFramePtr createCreditPaymentTx(Application& app,
 Operation pathPayment(PublicKey const& to, Asset const& sendCur,
                       int64_t sendMax, Asset const& destCur, int64_t destAmount,
                       std::vector<Asset> const& path);
+
+Operation pathPaymentStrictSend(PublicKey const& to, Asset const& sendCur,
+                                int64_t sendAmount, Asset const& destCur,
+                                int64_t destMin,
+                                std::vector<Asset> const& path);
 
 Operation manageOffer(int64 offerId, Asset const& selling, Asset const& buying,
                       Price const& price, int64_t amount);

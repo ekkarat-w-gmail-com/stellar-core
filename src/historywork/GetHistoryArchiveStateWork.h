@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "history/HistoryArchive.h"
 #include "work/Work.h"
 
 namespace medida
@@ -15,13 +16,12 @@ namespace stellar
 {
 
 class HistoryArchive;
-struct HistoryArchiveState;
 
 class GetHistoryArchiveStateWork : public Work
 {
     std::shared_ptr<BasicWork> mGetRemoteFile;
 
-    HistoryArchiveState& mState;
+    HistoryArchiveState mState;
     uint32_t mSeq;
     std::shared_ptr<HistoryArchive> mArchive;
     size_t mRetries;
@@ -29,12 +29,33 @@ class GetHistoryArchiveStateWork : public Work
 
     medida::Meter& mGetHistoryArchiveStateSuccess;
 
+    std::string getRemoteName() const;
+
   public:
     GetHistoryArchiveStateWork(
-        Application& app, HistoryArchiveState& state, uint32_t seq = 0,
+        Application& app, uint32_t seq = 0,
         std::shared_ptr<HistoryArchive> archive = nullptr,
-        size_t maxRetries = BasicWork::RETRY_A_FEW);
+        std::string mode = "", size_t maxRetries = BasicWork::RETRY_A_FEW);
     ~GetHistoryArchiveStateWork() = default;
+
+    HistoryArchiveState const&
+    getHistoryArchiveState() const
+    {
+        if (getState() != State::WORK_SUCCESS)
+        {
+            throw std::runtime_error("GetHistoryArchiveStateWork must succeed "
+                                     "before state retrieval");
+        }
+        return mState;
+    }
+
+    std::shared_ptr<HistoryArchive>
+    getArchive() const
+    {
+        return mArchive;
+    }
+
+    std::string getStatus() const override;
 
   protected:
     BasicWork::State doWork() override;

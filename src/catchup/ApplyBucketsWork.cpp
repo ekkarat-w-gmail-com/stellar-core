@@ -26,7 +26,7 @@ ApplyBucketsWork::ApplyBucketsWork(
     Application& app,
     std::map<std::string, std::shared_ptr<Bucket>> const& buckets,
     HistoryArchiveState const& applyState, uint32_t maxProtocolVersion)
-    : BasicWork(app, "apply-buckets", RETRY_A_FEW)
+    : BasicWork(app, "apply-buckets", BasicWork::RETRY_NEVER)
     , mBuckets(buckets)
     , mApplyState(applyState)
     , mApplying(false)
@@ -63,6 +63,8 @@ ApplyBucketsWork::getBucket(std::string const& hash)
 void
 ApplyBucketsWork::onReset()
 {
+    CLOG(INFO, "History") << "Applying buckets";
+
     mTotalBuckets = 0;
     mAppliedBuckets = 0;
     mAppliedEntries = 0;
@@ -90,6 +92,7 @@ ApplyBucketsWork::onReset()
 
     mLevel = BucketList::kNumLevels - 1;
     mApplying = false;
+
     mSnapBucket.reset();
     mCurrBucket.reset();
     mSnapApplicator.reset();
@@ -107,7 +110,9 @@ ApplyBucketsWork::startLevel()
 
     bool applySnap = (i.snap != binToHex(level.getSnap()->getHash()));
     bool applyCurr = (i.curr != binToHex(level.getCurr()->getHash()));
-    if (!mApplying && (applySnap || applyCurr))
+
+    if (!mApplying && !mApp.getConfig().MODE_USES_IN_MEMORY_LEDGER &&
+        (applySnap || applyCurr))
     {
         uint32_t oldestLedger = applySnap
                                     ? BucketList::oldestLedgerInSnap(
@@ -143,6 +148,16 @@ ApplyBucketsWork::startLevel()
 BasicWork::State
 ApplyBucketsWork::onRun()
 {
+    if (!mHaveCheckedApplyStateValidity && mLevel == BucketList::kNumLevels - 1)
+    {
+        if (!mApplyState.containsValidBuckets(mApp))
+        {
+            CLOG(ERROR, "History") << "Malformed HAS: unable to apply buckets";
+            return State::WORK_FAILURE;
+        }
+        mHaveCheckedApplyStateValidity = true;
+    }
+
     // Check if we're at the beginning of the new level
     if (isLevelComplete())
     {
@@ -182,7 +197,6 @@ ApplyBucketsWork::onRun()
         mBucketApplySuccess.Mark();
     }
 
-    mApp.getCatchupManager().logAndUpdateCatchupStatus(true);
     if (mLevel != 0)
     {
         --mLevel;
@@ -191,8 +205,9 @@ ApplyBucketsWork::onRun()
         return State::WORK_RUNNING;
     }
 
-    CLOG(DEBUG, "History") << "ApplyBuckets : done, restarting merges";
+    CLOG(INFO, "History") << "ApplyBuckets : done, restarting merges";
     mApp.getBucketManager().assumeState(mApplyState, mMaxProtocolVersion);
+
     return State::WORK_SUCCESS;
 }
 
@@ -255,5 +270,12 @@ void
 ApplyBucketsWork::onFailureRetry()
 {
     mBucketApplyFailure.Mark();
+}
+
+std::string
+ApplyBucketsWork::getStatus() const
+{
+    return fmt::format("Applying buckets {}%. Currently on level {}",
+                       (100 * mAppliedSize / mTotalSize), mLevel);
 }
 }

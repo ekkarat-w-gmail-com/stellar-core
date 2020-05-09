@@ -50,6 +50,7 @@ class LoadManager;
 class PeerAuth;
 class PeerBareAddress;
 class PeerManager;
+class SurveyManager;
 
 class OverlayManager
 {
@@ -73,11 +74,34 @@ class OverlayManager
     // given broadcast message, so that it is inhibited from being resent to
     // that peer. This does _not_ cause the message to be broadcast anew; to do
     // that, call broadcastMessage, above.
-    virtual void recvFloodedMsg(StellarMessage const& msg,
-                                Peer::pointer peer) = 0;
+    // Returns true if this is a new message
+    // fills msgID with msg's hash
+    virtual bool recvFloodedMsgID(StellarMessage const& msg, Peer::pointer peer,
+                                  Hash& msgID) = 0;
+
+    bool
+    recvFloodedMsg(StellarMessage const& msg, Peer::pointer peer)
+    {
+        Hash msgID;
+        return recvFloodedMsgID(msg, peer, msgID);
+    }
+
+    // removes msgID from the floodgate's internal state
+    // as it's not tracked anymore, calling "broadcast" with a (now forgotten)
+    // message with the ID msgID will cause it to be broadcast to all peers
+    virtual void forgetFloodedMsg(Hash const& msgID) = 0;
 
     // Return a list of random peers from the set of authenticated peers.
     virtual std::vector<Peer::pointer> getRandomAuthenticatedPeers() = 0;
+
+    // Return a list of random peers from the set of inbound authenticated
+    // peers.
+    virtual std::vector<Peer::pointer> getRandomInboundAuthenticatedPeers() = 0;
+
+    // Return a list of random peers from the set of outbound authenticated
+    // peers.
+    virtual std::vector<Peer::pointer>
+    getRandomOutboundAuthenticatedPeers() = 0;
 
     // Return an already-connected peer at the given address; returns a
     // `nullptr`-valued pointer if no such connected peer exists.
@@ -137,6 +161,9 @@ class OverlayManager
     // returns the list of peers that sent us the item with hash `h`
     virtual std::set<Peer::pointer> getPeersKnows(Hash const& h) = 0;
 
+    // Return the persistent overlay metrics structure.
+    virtual OverlayMetrics& getOverlayMetrics() = 0;
+
     // Return the persistent p2p authentication-key cache.
     virtual PeerAuth& getPeerAuth() = 0;
 
@@ -146,12 +173,20 @@ class OverlayManager
     // Return the persistent peer manager
     virtual PeerManager& getPeerManager() = 0;
 
+    virtual SurveyManager& getSurveyManager() = 0;
+
     // start up all background tasks for overlay
     virtual void start() = 0;
     // drops all connections
     virtual void shutdown() = 0;
 
     virtual bool isShuttingDown() const = 0;
+
+    virtual void recordMessageMetric(StellarMessage const& stellarMsg,
+                                     Peer::pointer peer) = 0;
+
+    virtual void updateFloodRecord(StellarMessage const& oldMsg,
+                                   StellarMessage const& newMsg) = 0;
 
     virtual ~OverlayManager()
     {

@@ -7,9 +7,9 @@
 
 #include "history/HistoryManager.h"
 #include "ledger/LedgerManager.h"
-#include "ledger/SyncingLedgerChain.h"
 #include "main/PersistentState.h"
 #include "transactions/TransactionFrame.h"
+#include "util/XDRStream.h"
 #include "xdr/Stellar-ledger.h"
 #include <string>
 
@@ -24,6 +24,7 @@ namespace medida
 class Timer;
 class Counter;
 class Histogram;
+class Buckets;
 }
 
 namespace stellar
@@ -39,43 +40,36 @@ class LedgerManagerImpl : public LedgerManager
 
   protected:
     Application& mApp;
+    std::unique_ptr<XDROutputFileStream> mMetaStream;
 
   private:
     medida::Timer& mTransactionApply;
     medida::Histogram& mTransactionCount;
     medida::Histogram& mOperationCount;
-    medida::Counter& mInternalErrorCount;
+    medida::Histogram& mPrefetchHitRate;
     medida::Timer& mLedgerClose;
-    medida::Timer& mLedgerAgeClosed;
+    medida::Buckets& mLedgerAgeClosed;
     medida::Counter& mLedgerAge;
-    medida::Counter& mPrefetchHitRate;
     VirtualClock::time_point mLastClose;
 
-    medida::Counter& mSyncingLedgersSize;
-    uint32_t mCatchupTriggerLedger{0};
+    std::unique_ptr<VirtualClock::time_point> mStartCatchup;
+    medida::Timer& mCatchupDuration;
 
-    CatchupState mCatchupState{CatchupState::NONE};
+    void
+    processFeesSeqNums(std::vector<TransactionFrameBasePtr>& txs,
+                       AbstractLedgerTxn& ltxOuter, int64_t baseFee,
+                       std::unique_ptr<LedgerCloseMeta> const& ledgerCloseMeta);
 
-    void addToSyncingLedgers(LedgerCloseData const& ledgerData);
-    void startCatchupIf(uint32_t lastReceivedLedgerSeq);
-
-    void historyCaughtup(asio::error_code const& ec,
-                         CatchupWork::ProgressState progressState,
-                         LedgerHeaderHistoryEntry const& lastClosed,
-                         CatchupConfiguration::Mode catchupMode);
-
-    void processFeesSeqNums(std::vector<TransactionFramePtr>& txs,
-                            AbstractLedgerTxn& ltxOuter, int64_t baseFee);
-
-    void applyTransactions(std::vector<TransactionFramePtr>& txs,
-                           AbstractLedgerTxn& ltx,
-                           TransactionResultSet& txResultSet);
+    void
+    applyTransactions(std::vector<TransactionFrameBasePtr>& txs,
+                      AbstractLedgerTxn& ltx, TransactionResultSet& txResultSet,
+                      std::unique_ptr<LedgerCloseMeta> const& ledgerCloseMeta);
 
     void ledgerClosed(AbstractLedgerTxn& ltx);
 
     void storeCurrentLedger(LedgerHeader const& header);
-    void prefetchTransactionData(std::vector<TransactionFramePtr>& txs);
-    void prefetchTxSourceIds(std::vector<TransactionFramePtr>& txs);
+    void prefetchTransactionData(std::vector<TransactionFrameBasePtr>& txs);
+    void prefetchTxSourceIds(std::vector<TransactionFrameBasePtr>& txs);
 
     enum class CloseLedgerIfResult
     {
@@ -93,15 +87,7 @@ class LedgerManagerImpl : public LedgerManager
                                                    uint32_t ledgerSeq,
                                                    uint32_t ledgerVers);
 
-    SyncingLedgerChain mSyncingLedgers;
-
-    void applyBufferedLedgers();
-    void setCatchupState(CatchupState s);
     void advanceLedgerPointers(LedgerHeader const& header);
-
-    void initializeCatchup(LedgerCloseData const& ledgerData);
-    void continueCatchup(LedgerCloseData const& ledgerData);
-    void finalizeCatchup(LedgerCloseData const& ledgerData);
     void logTxApplyMetrics(AbstractLedgerTxn& ltx, size_t numTxs,
                            size_t numOps);
 
@@ -110,12 +96,12 @@ class LedgerManagerImpl : public LedgerManager
 
     void bootstrap() override;
     State getState() const override;
-    CatchupState getCatchupState() const override;
     std::string getStateHuman() const override;
 
     void valueExternalized(LedgerCloseData const& ledgerData) override;
 
     uint32_t getLastMaxTxSetSize() const override;
+    uint32_t getLastMaxTxSetSizeOps() const override;
     int64_t getLastMinBalance(uint32_t ownerCount) const override;
     uint32_t getLastReserve() const override;
     uint32_t getLastTxFee() const override;
@@ -124,7 +110,7 @@ class LedgerManagerImpl : public LedgerManager
     uint64_t secondsSinceLastLedgerClose() const override;
     void syncMetrics() override;
 
-    void startNewLedger(LedgerHeader genesisLedger);
+    void startNewLedger(LedgerHeader const& genesisLedger);
     void startNewLedger() override;
     void loadLastKnownLedger(
         std::function<void(asio::error_code const& ec)> handler) override;
@@ -135,10 +121,16 @@ class LedgerManagerImpl : public LedgerManager
 
     Database& getDatabase() override;
 
-    void startCatchup(CatchupConfiguration configuration) override;
+    void startCatchup(CatchupConfiguration configuration,
+                      std::shared_ptr<HistoryArchive> archive) override;
 
     void closeLedger(LedgerCloseData const& ledgerData) override;
     void deleteOldEntries(Database& db, uint32_t ledgerSeq,
                           uint32_t count) override;
+
+    void
+    setLastClosedLedger(LedgerHeaderHistoryEntry const& lastClosed) override;
+
+    void setupLedgerCloseMetaStream();
 };
 }

@@ -12,6 +12,7 @@
 #include "bucket/BucketManager.h"
 #include "bucket/BucketOutputIterator.h"
 #include "bucket/LedgerCmp.h"
+#include "bucket/MergeKey.h"
 #include "crypto/Hex.h"
 #include "crypto/Random.h"
 #include "crypto/SHA.h"
@@ -136,7 +137,8 @@ std::shared_ptr<Bucket>
 Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
               std::vector<LedgerEntry> const& initEntries,
               std::vector<LedgerEntry> const& liveEntries,
-              std::vector<LedgerKey> const& deadEntries, bool countMergeEvents)
+              std::vector<LedgerKey> const& deadEntries, bool countMergeEvents,
+              asio::io_context& ctx, bool doFsync)
 {
     // When building fresh buckets after protocol version 10 (i.e. version
     // 11-or-after) we differentiate INITENTRY from LIVEENTRY. In older
@@ -150,7 +152,8 @@ Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
         convertToBucketEntry(useInit, initEntries, liveEntries, deadEntries);
 
     MergeCounters mc;
-    BucketOutputIterator out(bucketManager.getTmpDir(), true, meta, mc);
+    BucketOutputIterator out(bucketManager.getTmpDir(), true, meta, mc, ctx,
+                             doFsync);
     for (auto const& e : entries)
     {
         out.put(e);
@@ -235,7 +238,7 @@ maybePut(BucketOutputIterator& out, BucketEntry const& entry,
     //
     // Note that this decision only controls whether to elide dead entries due
     // to _shadows_. There is a secondary elision of dead entries at the _oldest
-    // level_ of the bucketlist that is accompished through filtering at the
+    // level_ of the bucketlist that is accomplished through filtering at the
     // BucketOutputIterator level, and happens independent of ledger protocol
     // version.
 
@@ -324,7 +327,7 @@ countNewEntryType(MergeCounters& mc, BucketEntry const& e)
 // preserves lifecycle-events.
 //
 //     IOW we want to prevent the following scenario
-//     (assumign lev1 and lev2 are on the new protocol, but 3 and 4
+//     (assuming lev1 and lev2 are on the new protocol, but 3 and 4
 //      are on the old protocol):
 //
 //       lev1:DEAD, lev2:INIT, lev3:DEAD, lev4:LIVE
@@ -353,10 +356,18 @@ calculateMergeProtocolVersion(
     protocolVersion = std::max(oi.getMetadata().ledgerVersion,
                                ni.getMetadata().ledgerVersion);
 
+    // Starting with FIRST_PROTOCOL_SHADOWS_REMOVED,
+    // protocol version is determined as a max of curr, snap, and any shadow of
+    // version < FIRST_PROTOCOL_SHADOWS_REMOVED. This means that a bucket may
+    // still perform an old style merge despite the presence of the new protocol
+    // shadows.
     for (auto const& si : shadowIterators)
     {
-        protocolVersion =
-            std::max(si.getMetadata().ledgerVersion, protocolVersion);
+        auto version = si.getMetadata().ledgerVersion;
+        if (version < Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
+        {
+            protocolVersion = std::max(version, protocolVersion);
+        }
     }
 
     CLOG(TRACE, "Bucket") << "Bucket merge protocolVersion=" << protocolVersion
@@ -384,6 +395,19 @@ calculateMergeProtocolVersion(
     {
         ++mc.mPostInitEntryProtocolMerges;
     }
+
+    if (protocolVersion < Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
+    {
+        ++mc.mPreShadowRemovalProtocolMerges;
+    }
+    else
+    {
+        if (!shadowIterators.empty())
+        {
+            throw std::runtime_error("Shadows are not supported");
+        }
+        ++mc.mPostShadowRemovalProtocolMerges;
+    }
 }
 
 // There are 4 "easy" cases for merging: exhausted iterators on either
@@ -392,7 +416,7 @@ calculateMergeProtocolVersion(
 // not scrutinizing the entry type further.
 static bool
 mergeCasesWithDefaultAcceptance(
-    BucketEntryIdCmp& cmp, MergeCounters& mc, BucketInputIterator& oi,
+    BucketEntryIdCmp const& cmp, MergeCounters& mc, BucketInputIterator& oi,
     BucketInputIterator& ni, BucketOutputIterator& out,
     std::vector<BucketInputIterator>& shadowIterators, uint32_t protocolVersion,
     bool keepShadowedLifecycleEntries)
@@ -565,7 +589,8 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
               std::shared_ptr<Bucket> const& oldBucket,
               std::shared_ptr<Bucket> const& newBucket,
               std::vector<std::shared_ptr<Bucket>> const& shadows,
-              bool keepDeadEntries, bool countMergeEvents)
+              bool keepDeadEntries, bool countMergeEvents,
+              asio::io_context& ctx, bool doFsync)
 {
     // This is the key operation in the scheme: merging two (read-only)
     // buckets together into a new 3rd bucket, while calculating its hash,
@@ -590,7 +615,7 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     BucketMetadata meta;
     meta.ledgerVersion = protocolVersion;
     BucketOutputIterator out(bucketManager.getTmpDir(), keepDeadEntries, meta,
-                             mc);
+                             mc, ctx, doFsync);
 
     BucketEntryIdCmp cmp;
     while (oi || ni)
@@ -608,6 +633,15 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     {
         bucketManager.incrMergeCounters(mc);
     }
-    return out.getBucket(bucketManager);
+    MergeKey mk{keepDeadEntries, oldBucket, newBucket, shadows};
+    return out.getBucket(bucketManager, &mk);
+}
+
+uint32_t
+Bucket::getBucketVersion(std::shared_ptr<Bucket> const& bucket)
+{
+    assert(bucket);
+    BucketInputIterator it(bucket);
+    return it.getMetadata().ledgerVersion;
 }
 }

@@ -37,14 +37,19 @@ ManageOfferOpFrameBase::checkOfferValid(AbstractLedgerTxn& ltxOuter)
         return true;
     }
 
+    auto ledgerVersion = ltx.loadHeader().current().ledgerVersion;
+
     if (mSheep.type() != ASSET_TYPE_NATIVE)
     {
         auto sheepLineA = loadTrustLine(ltx, getSourceID(), mSheep);
-        auto issuer = stellar::loadAccount(ltx, getIssuer(mSheep));
-        if (!issuer)
+        if (ledgerVersion < 13)
         {
-            setResultSellNoIssuer();
-            return false;
+            auto issuer = stellar::loadAccount(ltx, getIssuer(mSheep));
+            if (!issuer)
+            {
+                setResultSellNoIssuer();
+                return false;
+            }
         }
         if (!sheepLineA)
         { // we don't have what we are trying to sell
@@ -67,11 +72,15 @@ ManageOfferOpFrameBase::checkOfferValid(AbstractLedgerTxn& ltxOuter)
     if (mWheat.type() != ASSET_TYPE_NATIVE)
     {
         auto wheatLineA = loadTrustLine(ltx, getSourceID(), mWheat);
-        auto issuer = stellar::loadAccount(ltx, getIssuer(mWheat));
-        if (!issuer)
+
+        if (ledgerVersion < 13)
         {
-            setResultBuyNoIssuer();
-            return false;
+            auto issuer = stellar::loadAccount(ltx, getIssuer(mWheat));
+            if (!issuer)
+            {
+                setResultBuyNoIssuer();
+                return false;
+            }
         }
         if (!wheatLineA)
         { // we can't hold what we are trying to buy
@@ -272,7 +281,7 @@ ManageOfferOpFrameBase::doApply(AbstractLedgerTxn& ltxOuter)
         Price maxWheatPrice(mPrice.d, mPrice.n);
         ConvertResult r = convertWithOffers(
             ltx, mSheep, maxSheepSend, sheepSent, mWheat, maxWheatReceive,
-            wheatReceived, false,
+            wheatReceived, RoundingType::NORMAL,
             [this, passive, &maxWheatPrice](LedgerTxnEntry const& entry) {
                 auto const& o = entry.current().data.offer();
                 assert(o.offerID != mOfferID);
@@ -417,7 +426,7 @@ ManageOfferOpFrameBase::doApply(AbstractLedgerTxn& ltxOuter)
                     "Unexpected result from addNumEntries");
             }
 
-            newOffer.data.offer().offerID = generateID(header);
+            newOffer.data.offer().offerID = generateNewOfferID(header);
             getSuccessResult().offer.effect(MANAGE_OFFER_CREATED);
         }
         else
@@ -447,6 +456,12 @@ ManageOfferOpFrameBase::doApply(AbstractLedgerTxn& ltxOuter)
 
     ltx.commit();
     return true;
+}
+
+int64_t
+ManageOfferOpFrameBase::generateNewOfferID(LedgerTxnHeader& header)
+{
+    return generateID(header);
 }
 
 LedgerEntry
@@ -523,8 +538,6 @@ ManageOfferOpFrameBase::insertLedgerKeysToPrefetch(
     auto addIssuerAndTrustline = [&](Asset const& asset) {
         if (asset.type() != ASSET_TYPE_NATIVE)
         {
-            auto issuer = getIssuer(asset);
-            keys.emplace(accountKey(issuer));
             keys.emplace(trustlineKey(this->getSourceID(), asset));
         }
     };

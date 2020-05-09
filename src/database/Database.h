@@ -134,7 +134,7 @@ class Database : NonMovableOrCopyable
 
     // Return a helper object that borrows, from the Database, a prepared
     // statement handle for the provided query. The prepared statement handle
-    // is ceated if necessary before borrowing, and reset (unbound from data)
+    // is created if necessary before borrowing, and reset (unbound from data)
     // when the statement context is destroyed.
     StatementContext getPreparedStatement(std::string const& query);
 
@@ -158,6 +158,13 @@ class Database : NonMovableOrCopyable
 
     // Return true if the Database target is SQLite, otherwise false.
     bool isSqlite() const;
+
+    // Return an optional SQL COLLATION clause to use for text-typed columns in
+    // this database, in order to ensure they're compared "simply" using
+    // byte-value comparisons, i.e. in a non-language-sensitive fashion.  For
+    // Postgresql this will be 'COLLATE "C"' and for SQLite, nothing (its
+    // defaults are correct already).
+    std::string getSimpleCollationClause() const;
 
     // Call `op` back with the specific database backend subtype in use.
     template <typename T>

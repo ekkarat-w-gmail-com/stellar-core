@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "herder/HerderSCPDriver.h"
+#include "HerderUtils.h"
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "crypto/SecretKey.h"
@@ -13,6 +14,7 @@
 #include "main/Application.h"
 #include "main/ErrorMessages.h"
 #include "scp/SCP.h"
+#include "scp/Slot.h"
 #include "util/Logging.h"
 #include "xdr/Stellar-SCP.h"
 #include "xdr/Stellar-ledger-entries.h"
@@ -35,6 +37,11 @@ HerderSCPDriver::SCPMetrics::SCPMetrics(Application& app)
           app.getMetrics().NewTimer({"scp", "timing", "nominated"}))
     , mPrepareToExternalize(
           app.getMetrics().NewTimer({"scp", "timing", "externalized"}))
+    , mExternalizeLag(
+          app.getMetrics().NewTimer({"scp", "timing", "externalize-lag"}))
+    , mExternalizeDelay(
+          app.getMetrics().NewTimer({"scp", "timing", "externalize-delay"}))
+
 {
 }
 
@@ -46,9 +53,14 @@ HerderSCPDriver::HerderSCPDriver(Application& app, HerderImpl& herder,
     , mLedgerManager{mApp.getLedgerManager()}
     , mUpgrades{upgrades}
     , mPendingEnvelopes{pendingEnvelopes}
-    , mSCP(*this, mApp.getConfig().NODE_SEED.getPublicKey(),
-           mApp.getConfig().NODE_IS_VALIDATOR, mApp.getConfig().QUORUM_SET)
+    , mSCP{*this, mApp.getConfig().NODE_SEED.getPublicKey(),
+           mApp.getConfig().NODE_IS_VALIDATOR, mApp.getConfig().QUORUM_SET}
     , mSCPMetrics{mApp}
+    , mNominateTimeout{mApp.getMetrics().NewHistogram(
+          {"scp", "timeout", "nominate"})}
+    , mPrepareTimeout{mApp.getMetrics().NewHistogram(
+          {"scp", "timeout", "prepare"})}
+    , mLedgerSeqNominating(0)
 {
 }
 
@@ -95,6 +107,53 @@ HerderSCPDriver::restoreSCPState(uint64_t index, StellarValue const& value)
 
 // envelope handling
 
+class SCPHerderEnvelopeWrapper : public SCPEnvelopeWrapper
+{
+    HerderImpl& mHerder;
+
+    SCPQuorumSetPtr mQSet;
+    std::vector<TxSetFramePtr> mTxSets;
+
+  public:
+    explicit SCPHerderEnvelopeWrapper(SCPEnvelope const& e, HerderImpl& herder)
+        : SCPEnvelopeWrapper(e), mHerder(herder)
+    {
+        // attach everything we can to the wrapper
+        auto qSetH = Slot::getCompanionQuorumSetHashFromStatement(e.statement);
+        mQSet = mHerder.getQSet(qSetH);
+        if (!mQSet)
+        {
+            throw std::runtime_error(
+                fmt::format("SCPHerderEnvelopeWrapper: Wrapping an unknown "
+                            "qset {} from envelope",
+                            hexAbbrev(qSetH)));
+        }
+        auto txSets = getTxSetHashes(e);
+        for (auto const& txSetH : txSets)
+        {
+            auto txSet = mHerder.getTxSet(txSetH);
+            if (txSet)
+            {
+                mTxSets.emplace_back(txSet);
+            }
+            else
+            {
+                throw std::runtime_error(
+                    fmt::format("SCPHerderEnvelopeWrapper: Wrapping an unknown "
+                                "tx set {} from envelope",
+                                hexAbbrev(txSetH)));
+            }
+        }
+    }
+};
+
+SCPEnvelopeWrapperPtr
+HerderSCPDriver::wrapEnvelope(SCPEnvelope const& envelope)
+{
+    auto r = std::make_shared<SCPHerderEnvelopeWrapper>(envelope, mHerder);
+    return r;
+}
+
 void
 HerderSCPDriver::signEnvelope(SCPEnvelope& envelope)
 {
@@ -109,19 +168,6 @@ HerderSCPDriver::emitEnvelope(SCPEnvelope const& envelope)
 }
 
 // value validation
-
-bool
-HerderSCPDriver::isSlotCompatibleWithCurrentState(uint64_t slotIndex) const
-{
-    bool res = false;
-    if (mLedgerManager.isSynced())
-    {
-        auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
-        res = (slotIndex == (lcl.header.ledgerSeq + 1));
-    }
-
-    return res;
-}
 
 bool
 HerderSCPDriver::checkCloseTime(uint64_t slotIndex, uint64_t lastCloseTime,
@@ -170,21 +216,13 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
         }
     }
 
-    bool compat = isSlotCompatibleWithCurrentState(slotIndex);
-
     auto const& lcl = mLedgerManager.getLastClosedLedgerHeader().header;
-
     // when checking close time, start with what we have locally
     lastCloseTime = lcl.scpValue.closeTime;
 
-    if (compat)
-    {
-        if (!checkCloseTime(slotIndex, lastCloseTime, b))
-        {
-            return SCPDriver::kInvalidValue;
-        }
-    }
-    else
+    // if this value is not for our local state,
+    // perform as many checks as we can
+    if (slotIndex != (lcl.ledgerSeq + 1))
     {
         if (slotIndex == lcl.ledgerSeq)
         {
@@ -270,9 +308,12 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
         return SCPDriver::kMaybeValidValue;
     }
 
-    Hash const& txSetHash = b.txSetHash;
+    // the value is against the local state, we can perform all checks
 
-    // we are fully synced up
+    if (!checkCloseTime(slotIndex, lastCloseTime, b))
+    {
+        return SCPDriver::kInvalidValue;
+    }
 
     if ((!nomination || lcl.ledgerVersion < 11) &&
         b.ext.v() != STELLAR_VALUE_BASIC)
@@ -294,32 +335,32 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
         return SCPDriver::kInvalidValue;
     }
 
+    Hash const& txSetHash = b.txSetHash;
     TxSetFramePtr txSet = mPendingEnvelopes.getTxSet(txSetHash);
 
     SCPDriver::ValidationLevel res;
 
     if (!txSet)
     {
-        CLOG(ERROR, "Herder") << "HerderSCPDriver::validateValue"
-                              << " i: " << slotIndex << " txSet not found?";
+        CLOG(ERROR, "Herder") << "validateValue i:" << slotIndex
+                              << " unknown txSet " << hexAbbrev(txSetHash);
 
         res = SCPDriver::kInvalidValue;
     }
     else if (!txSet->checkValid(mApp))
     {
         if (Logging::logDebug("Herder"))
-            CLOG(DEBUG, "Herder") << "HerderSCPDriver::validateValue"
-                                  << " i: " << slotIndex << " Invalid txSet:"
-                                  << " " << hexAbbrev(txSet->getContentsHash());
+            CLOG(DEBUG, "Herder")
+                << "HerderSCPDriver::validateValue i: " << slotIndex
+                << " invalid txSet " << hexAbbrev(txSetHash);
         res = SCPDriver::kInvalidValue;
     }
     else
     {
         if (Logging::logDebug("Herder"))
             CLOG(DEBUG, "Herder")
-                << "HerderSCPDriver::validateValue"
-                << " i: " << slotIndex
-                << " txSet: " << hexAbbrev(txSet->getContentsHash()) << " OK";
+                << "HerderSCPDriver::validateValue i: " << slotIndex
+                << " valid txSet " << hexAbbrev(txSetHash);
         res = SCPDriver::kFullyValidatedValue;
     }
     return res;
@@ -384,7 +425,7 @@ HerderSCPDriver::validateValue(uint64_t slotIndex, Value const& value,
     return res;
 }
 
-Value
+ValueWrapperPtr
 HerderSCPDriver::extractValidValue(uint64_t slotIndex, Value const& value)
 {
     StellarValue b;
@@ -394,9 +435,9 @@ HerderSCPDriver::extractValidValue(uint64_t slotIndex, Value const& value)
     }
     catch (...)
     {
-        return Value();
+        return nullptr;
     }
-    Value res;
+    ValueWrapperPtr res;
     if (validateValueHelper(slotIndex, b, true) ==
         SCPDriver::kFullyValidatedValue)
     {
@@ -417,7 +458,7 @@ HerderSCPDriver::extractValidValue(uint64_t slotIndex, Value const& value)
             }
         }
 
-        res = xdr::xdr_to_opaque(b);
+        res = wrapStellarValue(b);
     }
 
     return res;
@@ -469,6 +510,25 @@ HerderSCPDriver::timerCallbackWrapper(uint64_t slotIndex, int timerID,
     }
     else
     {
+        auto SCPTimingIt = mSCPExecutionTimes.find(slotIndex);
+        if (SCPTimingIt != mSCPExecutionTimes.end())
+        {
+            auto& SCPTiming = SCPTimingIt->second;
+            if (timerID == Slot::BALLOT_PROTOCOL_TIMER)
+            {
+                // Timeout happened in between first prepare and externalize
+                ++SCPTiming.mPrepareTimeoutCount;
+            }
+            else
+            {
+                if (!SCPTiming.mPrepareStart)
+                {
+                    // Timeout happened between nominate and first prepare
+                    ++SCPTiming.mNominationTimeoutCount;
+                }
+            }
+        }
+
         cb();
     }
 }
@@ -544,9 +604,9 @@ compareTxSets(TxSetFramePtr l, TxSetFramePtr r, Hash const& lh, Hash const& rh,
     return lessThanXored(lh, rh, s);
 }
 
-Value
+ValueWrapperPtr
 HerderSCPDriver::combineCandidates(uint64_t slotIndex,
-                                   std::set<Value> const& candidates)
+                                   ValueWrapperPtrSet const& candidates)
 {
     CLOG(DEBUG, "Herder") << "Combining " << candidates.size() << " candidates";
     mSCPMetrics.mCombinedCandidates.Mark(candidates.size());
@@ -570,8 +630,8 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
         candidateValues.emplace_back();
         StellarValue& sv = candidateValues.back();
 
-        xdr::xdr_from_opaque(c, sv);
-        candidatesHash ^= sha256(c);
+        xdr::xdr_from_opaque(c->getValue(), sv);
+        candidatesHash ^= sha256(c->getValue());
 
         // max closeTime
         if (comp.closeTime < sv.closeTime)
@@ -661,18 +721,24 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
         CLOG(WARNING, "Herder") << "Candidate set had " << removed.size()
                                 << " invalid transactions";
 
+        // learn the updated tx set
+        bestTxSet = mPendingEnvelopes.putTxSet(bestTxSet->getContentsHash(),
+                                               slotIndex, bestTxSet);
+
         // post to avoid triggering SCP handling code recursively
-        mApp.postOnMainThreadWithDelay(
+        mApp.postOnMainThread(
             [this, bestTxSet]() {
                 mPendingEnvelopes.recvTxSet(bestTxSet->getContentsHash(),
                                             bestTxSet);
             },
-            "HerderSCPDriver: combineCandidates posts recvTxSet");
+            {VirtualClock::ExecutionCategory::Type::NORMAL_EVENT,
+             "HerderSCPDriver combineCandidates"});
     }
 
     // Ballot Protocol uses BASIC values
     comp.ext.v(STELLAR_VALUE_BASIC);
-    return xdr::xdr_to_opaque(comp);
+    auto res = wrapStellarValue(comp);
+    return res;
 }
 
 bool
@@ -733,7 +799,7 @@ HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
         logQuorumInformation(slotIndex - 2);
     }
 
-    if (!mCurrentValue.empty())
+    if (mCurrentValue)
     {
         // stop nomination
         // this may or may not be the ledger that is currently externalizing
@@ -741,7 +807,7 @@ HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
         // either we're closing the current ledger (typical case)
         // or we're going to trigger catchup from history
         mSCP.stopNomination(mLedgerSeqNominating);
-        mCurrentValue.clear();
+        mCurrentValue.reset();
     }
 
     if (!mTrackingSCP)
@@ -756,7 +822,14 @@ HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
         mLastTrackingSCP = std::make_unique<ConsensusData>(*mTrackingSCP);
     }
 
+    // record lag
+    recordSCPExternalizeEvent(slotIndex, mSCP.getLocalNodeID(), false);
+
     mHerder.valueExternalized(slotIndex, b);
+
+    // update externalize time so that we don't include the time spent in
+    // `mHerder.valueExternalized`
+    recordSCPExternalizeEvent(slotIndex, mSCP.getLocalNodeID(), true);
 }
 
 void
@@ -765,17 +838,13 @@ HerderSCPDriver::logQuorumInformation(uint64_t index)
     std::string res;
     auto v = mApp.getHerder().getJsonQuorumInfo(mSCP.getLocalNodeID(), true,
                                                 false, index);
-    auto slots = v.get("slots", "");
-    if (!slots.empty())
+    auto qset = v.get("qset", "");
+    if (!qset.empty())
     {
         std::string indexs = std::to_string(static_cast<uint32>(index));
-        auto i = slots.get(indexs, "");
-        if (!i.empty())
-        {
-            Json::FastWriter fw;
-            CLOG(INFO, "Herder")
-                << "Quorum information for " << index << " : " << fw.write(i);
-        }
+        Json::FastWriter fw;
+        CLOG(INFO, "Herder")
+            << "Quorum information for " << index << " : " << fw.write(qset);
     }
 }
 
@@ -784,10 +853,10 @@ HerderSCPDriver::nominate(uint64_t slotIndex, StellarValue const& value,
                           TxSetFramePtr proposedSet,
                           StellarValue const& previousValue)
 {
-    mCurrentValue = xdr::xdr_to_opaque(value);
+    mCurrentValue = wrapStellarValue(value);
     mLedgerSeqNominating = static_cast<uint32_t>(slotIndex);
 
-    auto valueHash = sha256(xdr::xdr_to_opaque(mCurrentValue));
+    auto valueHash = sha256(xdr::xdr_to_opaque(mCurrentValue->getValue()));
     CLOG(DEBUG, "Herder") << "HerderSCPDriver::triggerNextLedger"
                           << " txSet.size: "
                           << proposedSet->mTransactions.size()
@@ -878,6 +947,60 @@ HerderSCPDriver::recordSCPEvent(uint64_t slotIndex, bool isNomination)
 }
 
 void
+HerderSCPDriver::recordSCPExternalizeEvent(uint64_t slotIndex, NodeID const& id,
+                                           bool forceUpdateSelf)
+{
+    auto& timing = mSCPExecutionTimes[slotIndex];
+    auto now = mApp.getClock().now();
+
+    if (!timing.mFirstExternalize)
+    {
+        timing.mFirstExternalize = make_optional<VirtualClock::time_point>(now);
+    }
+
+    if (id == mSCP.getLocalNodeID())
+    {
+        if (!timing.mSelfExternalize)
+        {
+            recordLogTiming(*timing.mFirstExternalize, now,
+                            mSCPMetrics.mExternalizeLag, "externalize lag",
+                            std::chrono::nanoseconds::zero(), slotIndex);
+        }
+        if (!timing.mSelfExternalize || forceUpdateSelf)
+        {
+            timing.mSelfExternalize =
+                make_optional<VirtualClock::time_point>(now);
+        }
+    }
+    else if (timing.mSelfExternalize)
+    {
+        recordLogTiming(*timing.mSelfExternalize, now,
+                        mSCPMetrics.mExternalizeDelay,
+                        fmt::format("externalize delay ({})",
+                                    mApp.getConfig().toShortString(id)),
+                        std::chrono::nanoseconds::zero(), slotIndex);
+    }
+}
+
+void
+HerderSCPDriver::recordLogTiming(VirtualClock::time_point start,
+                                 VirtualClock::time_point end,
+                                 medida::Timer& timer,
+                                 std::string const& logStr,
+                                 std::chrono::nanoseconds threshold,
+                                 uint64_t slotIndex)
+{
+    auto delta =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    CLOG(DEBUG, "Herder") << fmt::format("{} delta for slot {} is {} ns.",
+                                         logStr, slotIndex, delta.count());
+    if (delta >= threshold)
+    {
+        timer.Update(delta);
+    }
+};
+
+void
 HerderSCPDriver::recordSCPExecutionMetrics(uint64_t slotIndex)
 {
     auto externalizeStart = mApp.getClock().now();
@@ -898,44 +1021,86 @@ HerderSCPDriver::recordSCPExecutionMetrics(uint64_t slotIndex)
 
     auto& SCPTiming = SCPTimingIt->second;
 
-    auto recordTiming = [&](VirtualClock::time_point start,
-                            VirtualClock::time_point end, medida::Timer& timer,
-                            std::string const& logStr) {
-        auto delta =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-        CLOG(DEBUG, "Herder") << fmt::format("{} delta for slot {} is {} ns.",
-                                             logStr, slotIndex, delta.count());
-        if (delta >= threshold)
-        {
-            timer.Update(delta);
-        }
-    };
+    mNominateTimeout.Update(SCPTiming.mNominationTimeoutCount);
+    mPrepareTimeout.Update(SCPTiming.mPrepareTimeoutCount);
 
     // Compute nomination time
     if (SCPTiming.mNominationStart && SCPTiming.mPrepareStart)
     {
-        recordTiming(*SCPTiming.mNominationStart, *SCPTiming.mPrepareStart,
-                     mSCPMetrics.mNominateToPrepare, "Nominate");
+        recordLogTiming(*SCPTiming.mNominationStart, *SCPTiming.mPrepareStart,
+                        mSCPMetrics.mNominateToPrepare, "Nominate", threshold,
+                        slotIndex);
     }
 
     // Compute prepare time
     if (SCPTiming.mPrepareStart)
     {
-        recordTiming(*SCPTiming.mPrepareStart, externalizeStart,
-                     mSCPMetrics.mPrepareToExternalize, "Prepare");
+        recordLogTiming(*SCPTiming.mPrepareStart, externalizeStart,
+                        mSCPMetrics.mPrepareToExternalize, "Prepare", threshold,
+                        slotIndex);
     }
+}
 
+void
+HerderSCPDriver::purgeSlots(uint64_t maxSlotIndex)
+{
     // Clean up timings map
     auto it = mSCPExecutionTimes.begin();
-    while (it != mSCPExecutionTimes.end() && it->first < slotIndex)
+    while (it != mSCPExecutionTimes.end() && it->first < maxSlotIndex)
     {
         it = mSCPExecutionTimes.erase(it);
     }
+
+    getSCP().purgeSlots(maxSlotIndex);
 }
 
 void
 HerderSCPDriver::clearSCPExecutionEvents()
 {
     mSCPExecutionTimes.clear();
+}
+
+// Value handling
+class SCPHerderValueWrapper : public ValueWrapper
+{
+    HerderImpl& mHerder;
+
+    TxSetFramePtr mTxSet;
+
+  public:
+    explicit SCPHerderValueWrapper(StellarValue const& sv, Value const& value,
+                                   HerderImpl& herder)
+        : ValueWrapper(value), mHerder(herder)
+    {
+        mTxSet = mHerder.getTxSet(sv.txSetHash);
+        if (!mTxSet)
+        {
+            throw std::runtime_error(fmt::format(
+                "SCPHerderValueWrapper tried to bind an unknown tx set {}",
+                hexAbbrev(sv.txSetHash)));
+        }
+    }
+};
+
+ValueWrapperPtr
+HerderSCPDriver::wrapValue(Value const& val)
+{
+    StellarValue sv;
+    auto b = mHerder.getHerderSCPDriver().toStellarValue(val, sv);
+    if (!b)
+    {
+        throw std::runtime_error(fmt::format(
+            "Invalid value in SCPHerderValueWrapper {}", binToHex(val)));
+    }
+    auto res = std::make_shared<SCPHerderValueWrapper>(sv, val, mHerder);
+    return res;
+}
+
+ValueWrapperPtr
+HerderSCPDriver::wrapStellarValue(StellarValue const& sv)
+{
+    auto val = xdr::xdr_to_opaque(sv);
+    auto res = std::make_shared<SCPHerderValueWrapper>(sv, val, mHerder);
+    return res;
 }
 }

@@ -50,6 +50,9 @@ load(Archive& ar, stellar::Upgrades::UpgradeParameters& o)
 
 namespace stellar
 {
+
+std::chrono::hours const Upgrades::UPDGRADE_EXPIRATION_HOURS(12);
+
 std::string
 Upgrades::UpgradeParameters::toJson() const
 {
@@ -198,10 +201,32 @@ Upgrades::toString() const
 Upgrades::UpgradeParameters
 Upgrades::removeUpgrades(std::vector<UpgradeType>::const_iterator beginUpdates,
                          std::vector<UpgradeType>::const_iterator endUpdates,
-                         bool& updated)
+                         uint64_t closeTime, bool& updated)
 {
     updated = false;
     UpgradeParameters res = mParams;
+
+    // If the upgrade time has been surpassed by more than X hours, then remove
+    // all upgrades.  This is done so nodes that come up with outdated upgrades
+    // don't attempt to change the network
+    if (res.mUpgradeTime + Upgrades::UPDGRADE_EXPIRATION_HOURS <=
+        VirtualClock::from_time_t(closeTime))
+    {
+        auto resetParamIfSet = [&](optional<uint32>& o) {
+            if (o)
+            {
+                o.reset();
+                updated = true;
+            }
+        };
+
+        resetParamIfSet(res.mProtocolVersion);
+        resetParamIfSet(res.mBaseFee);
+        resetParamIfSet(res.mMaxTxSize);
+        resetParamIfSet(res.mBaseReserve);
+
+        return res;
+    }
 
     auto resetParam = [&](optional<uint32>& o, uint32 v) {
         if (o && *o == v)
@@ -245,77 +270,90 @@ Upgrades::removeUpgrades(std::vector<UpgradeType>::const_iterator beginUpdates,
     return res;
 }
 
-bool
-Upgrades::isValid(UpgradeType const& upgrade, LedgerUpgradeType& upgradeType,
-                  bool nomination, Config const& cfg,
-                  LedgerHeader const& header) const
+Upgrades::UpgradeValidity
+Upgrades::isValidForApply(UpgradeType const& opaqueUpgrade,
+                          LedgerUpgrade& upgrade, LedgerHeader const& header,
+                          uint32_t maxLedgerVersion)
 {
-    if (nomination && !timeForUpgrade(header.scpValue.closeTime))
-    {
-        return false;
-    }
-
-    LedgerUpgrade lupgrade;
-
     try
     {
-        xdr::xdr_from_opaque(upgrade, lupgrade);
+        xdr::xdr_from_opaque(opaqueUpgrade, upgrade);
     }
     catch (xdr::xdr_runtime_error&)
     {
-        return false;
+        return UpgradeValidity::XDR_INVALID;
     }
 
     bool res = true;
-    switch (lupgrade.type())
+    switch (upgrade.type())
     {
     case LEDGER_UPGRADE_VERSION:
     {
-        uint32 newVersion = lupgrade.newLedgerVersion();
-        if (nomination)
-        {
-            res = mParams.mProtocolVersion &&
-                  (newVersion == *mParams.mProtocolVersion);
-        }
+        uint32 newVersion = upgrade.newLedgerVersion();
         // only allow upgrades to a supported version of the protocol
-        res = res && (newVersion <= cfg.LEDGER_PROTOCOL_VERSION);
+        res = res && (newVersion <= maxLedgerVersion);
         // and enforce versions to be strictly monotonic
         res = res && (newVersion > header.ledgerVersion);
     }
     break;
     case LEDGER_UPGRADE_BASE_FEE:
-    {
-        uint32 newFee = lupgrade.newBaseFee();
-        if (nomination)
-        {
-            res = mParams.mBaseFee && (newFee == *mParams.mBaseFee);
-        }
-        res = res && (newFee != 0);
-    }
-    break;
+        res = res && (upgrade.newBaseFee() != 0);
+        break;
     case LEDGER_UPGRADE_MAX_TX_SET_SIZE:
-    {
-        uint32 newMax = lupgrade.newMaxTxSetSize();
-        if (nomination)
-        {
-            res = mParams.mMaxTxSize && (newMax == *mParams.mMaxTxSize);
-        }
-        res = res && (newMax != 0);
-    }
-    break;
+        // any size is allowed
+        break;
     case LEDGER_UPGRADE_BASE_RESERVE:
-    {
-        uint32 newReserve = lupgrade.newBaseReserve();
-        if (nomination)
-        {
-            res = mParams.mBaseReserve && (newReserve == *mParams.mBaseReserve);
-        }
-        res = res && (newReserve != 0);
-    }
-    break;
+        res = res && (upgrade.newBaseReserve() != 0);
+        break;
     default:
         res = false;
     }
+
+    return res ? UpgradeValidity::VALID : UpgradeValidity::INVALID;
+}
+
+bool
+Upgrades::isValidForNomination(LedgerUpgrade const& upgrade,
+                               LedgerHeader const& header) const
+{
+    if (!timeForUpgrade(header.scpValue.closeTime))
+    {
+        return false;
+    }
+
+    switch (upgrade.type())
+    {
+    case LEDGER_UPGRADE_VERSION:
+        return mParams.mProtocolVersion &&
+               (upgrade.newLedgerVersion() == *mParams.mProtocolVersion);
+    case LEDGER_UPGRADE_BASE_FEE:
+        return mParams.mBaseFee && (upgrade.newBaseFee() == *mParams.mBaseFee);
+    case LEDGER_UPGRADE_MAX_TX_SET_SIZE:
+        return mParams.mMaxTxSize &&
+               (upgrade.newMaxTxSetSize() == *mParams.mMaxTxSize);
+    case LEDGER_UPGRADE_BASE_RESERVE:
+        return mParams.mBaseReserve &&
+               (upgrade.newBaseReserve() == *mParams.mBaseReserve);
+    default:
+        return false;
+    }
+}
+
+bool
+Upgrades::isValid(UpgradeType const& upgrade, LedgerUpgradeType& upgradeType,
+                  bool nomination, Config const& cfg,
+                  LedgerHeader const& header) const
+{
+    LedgerUpgrade lupgrade;
+    bool res =
+        isValidForApply(upgrade, lupgrade, header,
+                        cfg.LEDGER_PROTOCOL_VERSION) == UpgradeValidity::VALID;
+
+    if (nomination)
+    {
+        res = res && isValidForNomination(lupgrade, header);
+    }
+
     if (res)
     {
         upgradeType = lupgrade.type();
@@ -422,7 +460,7 @@ getAvailableBalanceExcludingLiabilities(AccountID const& accountID,
     else
     {
         auto trust = stellar::loadTrustLineWithoutRecord(ltx, accountID, asset);
-        if (trust && trust.isAuthorized())
+        if (trust && trust.isAuthorizedToMaintainLiabilities())
         {
             return trust.getBalance();
         }
@@ -453,7 +491,7 @@ getAvailableLimitExcludingLiabilities(AccountID const& accountID,
         key.trustLine().accountID = accountID;
         key.trustLine().asset = asset;
         auto trust = ltx.loadWithoutRecord(key);
-        if (trust && isAuthorized(trust))
+        if (trust && isAuthorizedToMaintainLiabilities(trust))
         {
             auto const& tl = trust.current().data.trustLine();
             return tl.limit - tl.balance;
@@ -692,6 +730,14 @@ prepareLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header)
                 if (deltaSelling != 0 || deltaBuying != 0)
                 {
                     ++nChangedTrustLines;
+                }
+
+                // the deltas should only be positive when liabilities were
+                // introduced in ledgerVersion 10
+                if (header.current().ledgerVersion > 10 &&
+                    (deltaSelling > 0 || deltaBuying > 0))
+                {
+                    throw std::runtime_error("invalid liabilities delta");
                 }
 
                 if (!trustEntry.addSellingLiabilities(header, deltaSelling))
